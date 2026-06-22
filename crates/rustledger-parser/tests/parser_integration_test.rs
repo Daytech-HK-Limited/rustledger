@@ -275,6 +275,75 @@ fn test_parse_custom_directive() {
     assert_eq!(count_directive_type(&result, "custom"), 1);
 }
 
+/// Regression: custom directive values must preserve a leading `MINUS` sign and
+/// carry `Tag`/`Link` values. `extract_custom_values` previously had no `MINUS`
+/// arm (so `-50.00` emitted `+50.00`) and dropped tags/links entirely. All three
+/// value-token extractors now share `value_tokens_to_meta`.
+#[test]
+fn test_custom_directive_preserves_sign_and_tag_link() {
+    use rust_decimal_macros::dec;
+    use rustledger_core::{Amount, Currency, MetaValue};
+
+    let source = r#"2024-01-01 custom "budget" -50.00 USD #quarterly ^plan-2024 TRUE"#;
+    let result = parse_ok(source);
+    let spanned = result
+        .directives
+        .iter()
+        .find(|d| matches!(d.value, Directive::Custom(_)))
+        .expect("expected a custom directive");
+    let Directive::Custom(custom) = &spanned.value else {
+        unreachable!()
+    };
+
+    assert_eq!(
+        custom.values,
+        vec![
+            // Signed amount keeps its sign (was emitted as +50.00).
+            MetaValue::Amount(Amount::new(dec!(-50.00), Currency::new("USD"))),
+            // Tag and Link are no longer dropped.
+            MetaValue::Tag("quarterly".into()),
+            MetaValue::Link("plan-2024".into()),
+            MetaValue::Bool(true),
+        ],
+        "custom values: {:?}",
+        custom.values
+    );
+}
+
+/// Regression: a `pushmeta` value of `NUMBER CURRENCY` must parse as an
+/// `Amount`. Before the three value-token walks were unified through
+/// `value_tokens_to_meta`, `pushmeta_value` returned on the `NUMBER` token and
+/// dropped the currency (`5 USD` became `Number(5)`).
+#[test]
+fn test_pushmeta_value_with_currency_is_amount() {
+    use rust_decimal_macros::dec;
+    use rustledger_core::{Amount, Currency, MetaValue};
+
+    let source = r"
+pushmeta budget: 5 USD
+2024-01-01 open Assets:Cash USD
+popmeta budget:
+";
+    let result = parse_ok(source);
+    let open = result
+        .directives
+        .iter()
+        .find_map(|d| match &d.value {
+            Directive::Open(o) => Some(o),
+            _ => None,
+        })
+        .expect("expected an open directive");
+    assert_eq!(
+        open.meta.get("budget"),
+        Some(&MetaValue::Amount(Amount::new(
+            dec!(5),
+            Currency::new("USD")
+        ))),
+        "pushmeta budget should be Amount(5 USD); meta: {:?}",
+        open.meta
+    );
+}
+
 // ============================================================================
 // Options, Includes, and Plugins
 // ============================================================================
