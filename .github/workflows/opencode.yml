@@ -41,11 +41,11 @@ jobs:
       issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Run opencode
-        uses: anomalyco/opencode/github@4ed4f749e644ffb5b279fb30b7b915e743d80142 # v1.17.7
+        uses: anomalyco/opencode/github@5c23e88419c4743b9be42cea132f2fb1e6cb63ff # v1.17.9
         env:
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
         with:
@@ -61,11 +61,11 @@ jobs:
       issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Run opencode (review and fix)
-        uses: anomalyco/opencode/github@4ed4f749e644ffb5b279fb30b7b915e743d80142
+        uses: anomalyco/opencode/github@5c23e88419c4743b9be42cea132f2fb1e6cb63ff
         env:
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
         with:
@@ -103,11 +103,11 @@ jobs:
       issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Run opencode (review only)
-        uses: anomalyco/opencode/github@4ed4f749e644ffb5b279fb30b7b915e743d80142
+        uses: anomalyco/opencode/github@5c23e88419c4743b9be42cea132f2fb1e6cb63ff
         env:
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
         with:
@@ -139,12 +139,12 @@ jobs:
       issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Run opencode (review and fix)
         if: inputs.action == 'review-and-fix'
-        uses: anomalyco/opencode/github@4ed4f749e644ffb5b279fb30b7b915e743d80142
+        uses: anomalyco/opencode/github@5c23e88419c4743b9be42cea132f2fb1e6cb63ff
         env:
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
         with:
@@ -168,7 +168,7 @@ jobs:
                - Open a PR that closes the issue
       - name: Run opencode (review only)
         if: inputs.action == 'review-only'
-        uses: anomalyco/opencode/github@4ed4f749e644ffb5b279fb30b7b915e743d80142
+        uses: anomalyco/opencode/github@5c23e88419c4743b9be42cea132f2fb1e6cb63ff
         env:
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
         with:
@@ -217,11 +217,11 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Run opencode on issue #${{ matrix.issue }}
-        uses: anomalyco/opencode/github@4ed4f749e644ffb5b279fb30b7b915e743d80142
+        uses: anomalyco/opencode/github@5c23e88419c4743b9be42cea132f2fb1e6cb63ff
         env:
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
         with:
