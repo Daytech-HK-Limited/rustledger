@@ -94,11 +94,21 @@ impl Executor<'_> {
         func: &FunctionCall,
         ctx: &PostingContext,
     ) -> Result<Value, QueryError> {
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.evaluate_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::interval_on_values(&args)
+    }
+
+    /// Value-core for `INTERVAL` function (construct an interval).
+    pub(crate) fn interval_on_values(args: &[Value]) -> Result<Value, QueryError> {
         // interval(unit) - creates an interval of 1 unit
         // interval(count, unit) - creates an interval of count units
-        match func.args.len() {
+        match args.len() {
             1 => {
-                let unit_str = match self.evaluate_expr(&func.args[0], ctx)? {
+                let unit_str = match args[0].clone() {
                     Value::String(s) => s,
                     _ => {
                         return Err(QueryError::Type(
@@ -115,7 +125,7 @@ impl Executor<'_> {
                 Ok(Value::Interval(Interval::new(1, unit)))
             }
             2 => {
-                let count = match self.evaluate_expr(&func.args[0], ctx)? {
+                let count = match args[0].clone() {
                     Value::Integer(n) => n,
                     Value::Number(d) => {
                         use rust_decimal::prelude::ToPrimitive;
@@ -135,7 +145,7 @@ impl Executor<'_> {
                         ));
                     }
                 };
-                let unit_str = match self.evaluate_expr(&func.args[1], ctx)? {
+                let unit_str = match args[1].clone() {
                     Value::String(s) => s,
                     _ => {
                         return Err(QueryError::Type(
@@ -167,10 +177,20 @@ impl Executor<'_> {
         func: &FunctionCall,
         ctx: &PostingContext,
     ) -> Result<Value, QueryError> {
-        match func.args.len() {
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.evaluate_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::date_construct_on_values(&args)
+    }
+
+    /// Value-core for `DATE` function (construct a date).
+    pub(crate) fn date_construct_on_values(args: &[Value]) -> Result<Value, QueryError> {
+        match args.len() {
             1 => {
                 // DATE(string) - parse ISO date
-                let val = self.evaluate_expr(&func.args[0], ctx)?;
+                let val = args[0].clone();
                 match val {
                     Value::String(s) => s
                         .parse::<NaiveDate>()
@@ -184,8 +204,9 @@ impl Executor<'_> {
             }
             3 => {
                 // DATE(year, month, day)
-                let year = match self.evaluate_expr(&func.args[0], ctx)? {
-                    Value::Integer(i) => i as i32,
+                let year = match args[0].clone() {
+                    Value::Integer(i) => i32::try_from(i)
+                        .map_err(|_| QueryError::Type("DATE: year out of range".to_string()))?,
                     Value::Number(n) => {
                         use rust_decimal::prelude::ToPrimitive;
                         n.to_i32().ok_or_else(|| {
@@ -198,8 +219,10 @@ impl Executor<'_> {
                         ));
                     }
                 };
-                let month = match self.evaluate_expr(&func.args[1], ctx)? {
-                    Value::Integer(i) => i as u32,
+                let month = match args[1].clone() {
+                    Value::Integer(i) => u32::try_from(i).map_err(|_| {
+                        QueryError::Type("DATE: month must be a non-negative integer".to_string())
+                    })?,
                     Value::Number(n) => {
                         use rust_decimal::prelude::ToPrimitive;
                         n.to_u32().ok_or_else(|| {
@@ -212,8 +235,10 @@ impl Executor<'_> {
                         ));
                     }
                 };
-                let day = match self.evaluate_expr(&func.args[2], ctx)? {
-                    Value::Integer(i) => i as u32,
+                let day = match args[2].clone() {
+                    Value::Integer(i) => u32::try_from(i).map_err(|_| {
+                        QueryError::Type("DATE: day must be a non-negative integer".to_string())
+                    })?,
                     Value::Number(n) => {
                         use rust_decimal::prelude::ToPrimitive;
                         n.to_u32().ok_or_else(|| {
@@ -275,9 +300,19 @@ impl Executor<'_> {
         func: &FunctionCall,
         ctx: &PostingContext,
     ) -> Result<Value, QueryError> {
-        Self::require_args("DATE_ADD", func, 2)?;
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.evaluate_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::date_add_on_values(&args)
+    }
 
-        let date = match self.evaluate_expr(&func.args[0], ctx)? {
+    /// Value-core for `DATE_ADD` function (add days or interval to a date).
+    pub(crate) fn date_add_on_values(args: &[Value]) -> Result<Value, QueryError> {
+        Self::require_args_count("DATE_ADD", args, 2)?;
+
+        let date = match args[0].clone() {
             Value::Date(d) => d,
             _ => {
                 return Err(QueryError::Type(
@@ -286,7 +321,7 @@ impl Executor<'_> {
             }
         };
 
-        let second_arg = self.evaluate_expr(&func.args[1], ctx)?;
+        let second_arg = args[1].clone();
         let result = match second_arg {
             Value::Integer(days) => add_days(date, days)?,
             Value::Number(n) => {
@@ -317,9 +352,19 @@ impl Executor<'_> {
         func: &FunctionCall,
         ctx: &PostingContext,
     ) -> Result<Value, QueryError> {
-        Self::require_args("DATE_TRUNC", func, 2)?;
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.evaluate_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::date_trunc_on_values(&args)
+    }
 
-        let field = match self.evaluate_expr(&func.args[0], ctx)? {
+    /// Value-core for `DATE_TRUNC` function (truncate date to field).
+    pub(crate) fn date_trunc_on_values(args: &[Value]) -> Result<Value, QueryError> {
+        Self::require_args_count("DATE_TRUNC", args, 2)?;
+
+        let field = match args[0].clone() {
             Value::String(s) => s.to_uppercase(),
             _ => {
                 return Err(QueryError::Type(
@@ -327,7 +372,7 @@ impl Executor<'_> {
                 ));
             }
         };
-        let date = match self.evaluate_expr(&func.args[1], ctx)? {
+        let date = match args[1].clone() {
             Value::Date(d) => d,
             _ => {
                 return Err(QueryError::Type(
@@ -369,9 +414,19 @@ impl Executor<'_> {
         func: &FunctionCall,
         ctx: &PostingContext,
     ) -> Result<Value, QueryError> {
-        Self::require_args("DATE_PART", func, 2)?;
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.evaluate_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::date_part_on_values(&args)
+    }
 
-        let field = match self.evaluate_expr(&func.args[0], ctx)? {
+    /// Value-core for `DATE_PART` function (extract date component).
+    pub(crate) fn date_part_on_values(args: &[Value]) -> Result<Value, QueryError> {
+        Self::require_args_count("DATE_PART", args, 2)?;
+
+        let field = match args[0].clone() {
             Value::String(s) => s.to_uppercase(),
             _ => {
                 return Err(QueryError::Type(
@@ -379,7 +434,7 @@ impl Executor<'_> {
                 ));
             }
         };
-        let date = match self.evaluate_expr(&func.args[1], ctx)? {
+        let date = match args[1].clone() {
             Value::Date(d) => d,
             _ => {
                 return Err(QueryError::Type(
@@ -421,16 +476,26 @@ impl Executor<'_> {
         func: &FunctionCall,
         ctx: &PostingContext,
     ) -> Result<Value, QueryError> {
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.evaluate_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::parse_date_on_values(&args)
+    }
+
+    /// Value-core for `PARSE_DATE` function (parse date with format).
+    pub(crate) fn parse_date_on_values(args: &[Value]) -> Result<Value, QueryError> {
         // beanquery accepts `parse_date(str)` (dateutil) and
         // `parse_date(str, format)`.
-        if func.args.is_empty() || func.args.len() > 2 {
+        if args.is_empty() || args.len() > 2 {
             return Err(QueryError::InvalidArguments(
                 "PARSE_DATE".to_string(),
                 "expected 1 or 2 arguments".to_string(),
             ));
         }
 
-        let string = match self.evaluate_expr(&func.args[0], ctx)? {
+        let string = match args[0].clone() {
             Value::String(s) => s,
             _ => {
                 return Err(QueryError::Type(
@@ -440,8 +505,8 @@ impl Executor<'_> {
         };
 
         // Two-arg form: explicit strftime format.
-        if func.args.len() == 2 {
-            let format = match self.evaluate_expr(&func.args[1], ctx)? {
+        if args.len() == 2 {
+            let format = match args[1].clone() {
                 Value::String(s) => s,
                 _ => {
                     return Err(QueryError::Type(
@@ -487,9 +552,19 @@ impl Executor<'_> {
         func: &FunctionCall,
         ctx: &PostingContext,
     ) -> Result<Value, QueryError> {
-        Self::require_args("DATE_BIN", func, 3)?;
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.evaluate_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::date_bin_on_values(&args)
+    }
 
-        let stride = match self.evaluate_expr(&func.args[0], ctx)? {
+    /// Value-core for `DATE_BIN` function (bin dates into buckets).
+    pub(crate) fn date_bin_on_values(args: &[Value]) -> Result<Value, QueryError> {
+        Self::require_args_count("DATE_BIN", args, 3)?;
+
+        let stride = match args[0].clone() {
             Value::String(s) => s,
             Value::Integer(days) => format!("{days} days"),
             _ => {
@@ -499,7 +574,7 @@ impl Executor<'_> {
             }
         };
 
-        let source = match self.evaluate_expr(&func.args[1], ctx)? {
+        let source = match args[1].clone() {
             Value::Date(d) => d,
             _ => {
                 return Err(QueryError::Type(
@@ -508,7 +583,7 @@ impl Executor<'_> {
             }
         };
 
-        let origin = match self.evaluate_expr(&func.args[2], ctx)? {
+        let origin = match args[2].clone() {
             Value::Date(d) => d,
             _ => {
                 return Err(QueryError::Type(
@@ -536,6 +611,14 @@ impl Executor<'_> {
             }
         };
 
+        // A non-positive stride amount would divide-by-zero in the bucket math
+        // below; reject it rather than panic (reachable now via eager #postings).
+        if amount <= 0 {
+            return Err(QueryError::Type(format!(
+                "DATE_BIN: stride amount must be positive, got {amount}"
+            )));
+        }
+
         // Calculate days from origin to source
         let days_diff = i64::from(source.since(origin).unwrap_or_default().get_days());
 
@@ -544,22 +627,19 @@ impl Executor<'_> {
         let oy = i32::from(origin.year());
         let om = i32::from(origin.month());
         let od = origin.day() as u32;
-        let amt = amount as i32;
+        let amt = i32::try_from(amount)
+            .map_err(|_| QueryError::Type("DATE_BIN: stride amount too large".to_string()))?;
 
         // Calculate binned date based on unit
         let binned = match unit.trim_end_matches('s') {
             "day" => {
                 let bucket = days_diff / amount;
-                origin
-                    .checked_add(jiff::ToSpan::days(bucket * amount))
-                    .unwrap()
+                add_days(origin, bucket * amount)?
             }
             "week" => {
                 let days_per_stride = amount * 7;
                 let bucket = days_diff / days_per_stride;
-                origin
-                    .checked_add(jiff::ToSpan::days(bucket * days_per_stride))
-                    .unwrap()
+                add_days(origin, bucket * days_per_stride)?
             }
             "month" => {
                 let months_diff = (sy - oy) * 12 + sm - om;
