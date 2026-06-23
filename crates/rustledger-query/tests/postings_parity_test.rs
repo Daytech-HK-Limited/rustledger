@@ -130,3 +130,59 @@ fn default_select_matches_postings_table() {
          posting-source implementations have drifted"
     );
 }
+
+/// Every `#postings` column the default `SELECT` path also computes. After the
+/// `type`/`cost_date` reconciliation (both were the default path being wrong vs
+/// the bean-query oracle), the two paths agree on ALL of these.
+const ALL_COLUMNS: &str = "type, id, date, year, month, day, flag, payee, narration, \
+     description, tags, links, posting_flag, account, other_accounts, number, currency, \
+     cost_number, cost_currency, cost_date, cost_label, position, price, weight, balance, \
+     account_balance";
+
+fn columns_that_diverge(dirs: &[Directive]) -> Vec<String> {
+    let mut executor = Executor::new(dirs);
+    ALL_COLUMNS
+        .split(',')
+        .map(str::trim)
+        .filter(|col| {
+            let direct = executor
+                .execute(&parse(&format!("SELECT {col}")).unwrap())
+                .unwrap();
+            let table = executor
+                .execute(&parse(&format!("SELECT {col} FROM #postings")).unwrap())
+                .unwrap();
+            direct.rows != table.rows
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// No `#postings` column may diverge from the default `SELECT` path — proven
+/// per-column so a failure names exactly which column drifted. This is the
+/// regression net for the upcoming single-posting-source iterator unification.
+#[test]
+fn no_columns_diverge_from_default_select() {
+    let diverge = columns_that_diverge(&fixture());
+    assert!(
+        diverge.is_empty(),
+        "columns where default SELECT and #postings diverge: {diverge:?}"
+    );
+}
+
+/// Full row-for-row parity across the entire projectable column set.
+#[test]
+fn all_columns_match_row_for_row() {
+    let dirs = fixture();
+    let mut executor = Executor::new(&dirs);
+    let direct = executor
+        .execute(&parse(&format!("SELECT {ALL_COLUMNS}")).unwrap())
+        .unwrap();
+    let table = executor
+        .execute(&parse(&format!("SELECT {ALL_COLUMNS} FROM #postings")).unwrap())
+        .unwrap();
+    assert_eq!(direct.columns, table.columns, "headers diverge");
+    assert_eq!(
+        direct.rows, table.rows,
+        "default SELECT and #postings diverge on a column value"
+    );
+}
