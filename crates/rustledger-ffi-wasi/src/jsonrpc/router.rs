@@ -535,7 +535,9 @@ fn handle_filter_entries(params: &serde_json::Value) -> Result<serde_json::Value
 }
 
 fn handle_clamp_entries(params: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
-    use crate::commands::clamp::clamp_entries;
+    use crate::commands::clamp::ClampResult;
+    use crate::convert::directive_to_json;
+    use crate::types::input::{InputEntry, input_entry_to_directive};
 
     let params: ClampEntriesParams = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::invalid_params(format!("Invalid params: {e}")))?;
@@ -556,8 +558,41 @@ fn handle_clamp_entries(params: &serde_json::Value) -> Result<serde_json::Value,
         .map_err(|e| RpcError::invalid_params(format!("Invalid end_date: {e}")))?
         .ok_or_else(|| RpcError::invalid_params("end_date is required"))?;
 
-    let result = clamp_entries(params.entries, begin_date, end_date);
-    serde_json::to_value(result).map_err(|e| RpcError::internal_error(e.to_string()))
+    // Route through the single typed clamp engine (`rustledger_ops::clamp`),
+    // the same one the ffi-component surface uses. Convert each input JSON entry
+    // to a core directive, remembering its index so a `clamp_indexed` source
+    // index maps an output back to the exact original JSON entry — in-window
+    // entries and carried-forward prices keep their original filename/lineno,
+    // and only the synthesized opening-balance / earnings summaries are built
+    // fresh. (Replaces the legacy 846-line JSON `clamp_entries`.)
+    // Convert every entry up front. A conversion failure is rejected (not
+    // skipped): a silently-dropped pre-`begin` entry would under-count the
+    // summarized opening balance and return a confidently-wrong clamp. Because
+    // nothing is skipped, `core[i]` lines up with `params.entries[i]`, so a
+    // `clamp_indexed` source index maps straight back to the original entry.
+    let mut core: Vec<rustledger_core::Directive> = Vec::with_capacity(params.entries.len());
+    for (i, entry) in params.entries.iter().enumerate() {
+        let input: InputEntry = serde_json::from_value(entry.clone())
+            .map_err(|e| RpcError::invalid_params(format!("entry {i}: {e}")))?;
+        core.push(
+            input_entry_to_directive(&input)
+                .map_err(|e| RpcError::invalid_params(format!("entry {i}: {e}")))?,
+        );
+    }
+
+    let entries = rustledger_ops::clamp::clamp_indexed(&core, begin_date, end_date)
+        .into_iter()
+        .map(|(d, src)| match src {
+            // Pass-through: original JSON entry, full fidelity + provenance.
+            Some(i) => Ok(params.entries[i].clone()),
+            // Synthesized summary: build fresh with the `<summarization>` source.
+            None => serde_json::to_value(directive_to_json(&d, 0, "<summarization>")),
+        })
+        .collect::<Result<Vec<serde_json::Value>, _>>()
+        .map_err(|e| RpcError::internal_error(e.to_string()))?;
+
+    serde_json::to_value(ClampResult { entries })
+        .map_err(|e| RpcError::internal_error(e.to_string()))
 }
 
 // =============================================================================
