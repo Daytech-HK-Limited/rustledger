@@ -711,23 +711,18 @@ fn convert_transaction(
     // with no flag token; defaults to '*').
     let flag = node.flag().map_or('*', |f| flag_char_from_transaction(&f));
 
-    // Header strings: with 2 -> payee + narration; with 1 ->
-    // narration-only; with 3+ -> ambiguous (typed-AST surface
-    // returns None for both, matching the round-2 review fix).
-    let strings: Vec<String> = node.strings().filter_map(|s| s.text_decoded()).collect();
-    let (payee_str, narration_str) = match strings.len() {
-        0 => (None, String::new()),
-        1 => (None, strings.into_iter().next().unwrap()),
-        2 => {
-            let mut it = strings.into_iter();
-            let p = it.next().unwrap();
-            let n = it.next().unwrap();
-            (Some(p), n)
-        }
-        // 3+ strings: surface only the last as narration; the
-        // middle ones are unreachable through this typed shape
-        // (matches the round-2 docstring).
-        _ => (None, strings.last().cloned().unwrap_or_default()),
+    // Header strings, consumed straight off the iterator (no intermediate Vec,
+    // no count-then-unwrap): 0 -> empty narration; 1 -> narration only;
+    // 2 -> payee + narration; 3+ -> surface only the last as narration (the
+    // middles are unreachable through this typed shape).
+    let mut it = node.strings().filter_map(|s| s.text_decoded());
+    let (payee_str, narration_str) = match (it.next(), it.next(), it.next()) {
+        (None, _, _) => (None, String::new()),
+        (Some(n), None, _) => (None, n),
+        (Some(p), Some(n), None) => (Some(p), n),
+        // 3+: `c` is the 3rd string; if more follow, `it.last()` is the actual
+        // last (else it falls back to `c`). No clone in the common 0/1/2 cases.
+        (Some(_), Some(_), Some(c)) => (None, it.last().unwrap_or(c)),
     };
 
     let payee = payee_str.map(InternedStr::from);
@@ -2911,6 +2906,21 @@ mod tests {
         assert_eq!(t.flag, '!');
         assert!(t.payee.is_none());
         assert_eq!(t.narration.as_str(), "Pending");
+    }
+
+    #[test]
+    fn transaction_three_plus_header_strings_surface_last_as_narration() {
+        // A header with 3+ strings is ambiguous (the grammar caps payee+narration
+        // at two); the lossless CST still keeps all of them, so the typed surface
+        // drops the payee and surfaces only the LAST string as narration. Locks
+        // the `(Some, Some, Some(c)) => it.last().unwrap_or(c)` arm.
+        let src = "2024-01-15 * \"a\" \"b\" \"c\"\n  Assets:Cash  -5 USD\n";
+        let result = parse_via_cst(src);
+        let Directive::Transaction(t) = &result.directives[0].value else {
+            panic!("expected Transaction");
+        };
+        assert!(t.payee.is_none(), "3+ strings drop the payee");
+        assert_eq!(t.narration.as_str(), "c", "last string becomes narration");
     }
 
     #[test]
