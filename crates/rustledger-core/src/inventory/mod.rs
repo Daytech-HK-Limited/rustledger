@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::{Amount, CostSpec, Position};
+use crate::{Account, Amount, CostSpec, Currency, Position, is_subaccount_or_equal};
 
 /// Inline storage for `BookingResult::matched`.
 ///
@@ -458,6 +458,31 @@ impl Inventory {
         })
     }
 
+    /// Whether a posting of `units` carrying `cost` would REDUCE this inventory
+    /// under `method` — the single source for the reduction-vs-augmentation
+    /// decision shared by the booking engine (`BookingEngine::apply`) and the
+    /// Late validator's inventory pass.
+    ///
+    /// A posting reduces only when it carries a cost spec (`cost.is_some()` —
+    /// presence of the spec, which includes an empty/unresolved one like `{}`),
+    /// the booking method isn't `NONE` (issue #1182 — `NONE` accumulates every
+    /// posting as an augmentation, with no lot matching), and the inventory holds
+    /// a cost-bearing position of the opposite sign in the same currency
+    /// ([`Self::is_reduced_by`] with [`ReductionScope::CostBearingOnly`]). This
+    /// gate was previously written byte-for-byte in both crates and the #1182 fix
+    /// had to be applied twice.
+    #[must_use]
+    pub fn is_booking_reduction(
+        &self,
+        units: &Amount,
+        cost: Option<&CostSpec>,
+        method: BookingMethod,
+    ) -> bool {
+        method != BookingMethod::None
+            && cost.is_some()
+            && self.is_reduced_by(units, ReductionScope::CostBearingOnly)
+    }
+
     /// Get the total book value (cost basis) for a currency.
     ///
     /// Returns the sum of all cost bases for positions of the given currency.
@@ -659,6 +684,36 @@ impl Inventory {
 
         result
     }
+}
+
+/// Sum the units of `currency` across `account` AND all of its sub-accounts,
+/// over a map of per-account inventories.
+///
+/// Beancount's `balance Assets:Bank` assertion — and the pad math that targets
+/// it — includes `Assets:Bank:Checking`, `Assets:Bank:Savings`, etc. (verified
+/// against `bean-check`: an assertion on a parent passes when the balance is held
+/// in a sub-account). Sub-account membership uses [`is_subaccount_or_equal`], so
+/// the segment-boundary rule (`Assets:BankAlias` does NOT match `Assets:Bank`)
+/// is shared.
+///
+/// This is the single source for that sum, used by both the booking pad engine
+/// and the Late balance validator. They previously computed the pad/assertion
+/// difference differently — booking summed only the leaf account
+/// (`Inventory::units`) while the validator summed sub-accounts — so a pad
+/// targeting a non-leaf account inserted the wrong synthetic amount.
+pub fn sum_account_and_subaccounts<'a, I>(
+    inventories: I,
+    account: &str,
+    currency: &Currency,
+) -> Decimal
+where
+    I: IntoIterator<Item = (&'a Account, &'a Inventory)>,
+{
+    inventories
+        .into_iter()
+        .filter(|(inv_account, _)| is_subaccount_or_equal(inv_account.as_str(), account))
+        .map(|(_, inv)| inv.units(currency))
+        .sum()
 }
 
 impl fmt::Display for Inventory {
@@ -2268,6 +2323,52 @@ mod tests {
             inv.is_reduced_by(&buy_units, ReductionScope::AllPositions),
             "without cost spec filter, the -25 HOOG simple position \
              should cause is_reduced_by to return true"
+        );
+    }
+
+    #[test]
+    fn is_booking_reduction_gates_on_method_cost_and_sign() {
+        // A cost-bearing long position.
+        let mut inv = Inventory::new();
+        inv.add(Position::with_cost(
+            Amount::new(dec!(10), "AAPL"),
+            Cost::new(dec!(150), "USD").with_date(date(2024, 1, 1)),
+        ));
+
+        let sell = Amount::new(dec!(-5), "AAPL"); // opposite sign of the held lot
+        let buy = Amount::new(dec!(5), "AAPL"); // same sign
+        let spec = CostSpec::empty(); // only spec *presence* (is_some) matters here
+
+        // Opposite-sign units carrying a cost spec under a lot-matching method
+        // is the one combination that reduces.
+        assert!(inv.is_booking_reduction(&sell, Some(&spec), BookingMethod::Strict));
+        // NONE never reduces — every posting accumulates (#1182).
+        assert!(!inv.is_booking_reduction(&sell, Some(&spec), BookingMethod::None));
+        // No cost spec -> augmentation.
+        assert!(!inv.is_booking_reduction(&sell, None, BookingMethod::Strict));
+        // Same sign as the held lot -> augmentation.
+        assert!(!inv.is_booking_reduction(&buy, Some(&spec), BookingMethod::Strict));
+    }
+
+    #[test]
+    fn sum_account_and_subaccounts_sums_children_not_prefix_siblings() {
+        let mut bank = Inventory::new();
+        bank.add(Position::simple(Amount::new(dec!(10), "USD")));
+        let mut checking = Inventory::new(); // sub-account: included
+        checking.add(Position::simple(Amount::new(dec!(40), "USD")));
+        let mut alias = Inventory::new(); // prefix sibling: excluded
+        alias.add(Position::simple(Amount::new(dec!(99), "USD")));
+
+        let mut map: FxHashMap<Account, Inventory> = FxHashMap::default();
+        map.insert(Account::from("Assets:Bank"), bank);
+        map.insert(Account::from("Assets:Bank:Checking"), checking);
+        map.insert(Account::from("Assets:BankAlias"), alias);
+
+        let total = sum_account_and_subaccounts(map.iter(), "Assets:Bank", &Currency::from("USD"));
+        assert_eq!(
+            total,
+            dec!(50),
+            "parent (10) + sub-account (40), excluding the Assets:BankAlias prefix sibling"
         );
     }
 
