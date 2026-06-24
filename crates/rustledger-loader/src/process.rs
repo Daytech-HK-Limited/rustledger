@@ -869,6 +869,56 @@ struct PluginInvocation {
     force_python: bool,
 }
 
+/// Lexically resolve `.` / `..` in `p` WITHOUT touching the filesystem,
+/// preserving the root/prefix. Unlike `Path::canonicalize` this works on paths
+/// that don't exist yet, so a `..` traversal is still collapsed (e.g.
+/// `/ledger/../../etc` → `/etc`). A `..` at the root is clamped (it can't escape
+/// above the root).
+#[cfg(feature = "plugins")]
+fn lexically_normalize(p: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether a `resolved` plugin path stays within `base_dir` under path-security.
+///
+/// When the plugin file exists, both sides are `canonicalize`d so symlinks are
+/// resolved (symlink-safe). When it does NOT *yet* exist (`NotFound`), both sides
+/// fall back to [`lexically_normalize`] in the SAME namespace, so a `..` escape
+/// is still caught. Any OTHER canonicalize error (permission denied, I/O) is
+/// genuinely unverifiable and is REJECTED — fail closed. This closes the
+/// fail-OPEN hole in the previous `let (Ok, Ok) = (canonicalize, canonicalize)`
+/// guard, which skipped the check entirely whenever either `canonicalize`
+/// returned `Err` — and which, even on success, string-prefix-matched an
+/// unresolved absolute `/base/../../etc` past `/base` because `..` was never
+/// collapsed.
+#[cfg(feature = "plugins")]
+fn plugin_path_within_base(resolved: &Path, base_dir: &Path) -> bool {
+    match resolved.canonicalize() {
+        Ok(canon_plugin) => match base_dir.canonicalize() {
+            Ok(canon_base) => canon_plugin.starts_with(&canon_base),
+            // Plugin canonicalized but base didn't — cannot compare in one
+            // namespace, so fail closed.
+            Err(_) => false,
+        },
+        // Only a not-yet-existing path falls back to the lexical `..` check; a
+        // permission/I/O error is unverifiable, so reject rather than guess.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            lexically_normalize(resolved).starts_with(lexically_normalize(base_dir))
+        }
+        Err(_) => false,
+    }
+}
+
 /// `pass` selects which subset of plugins to run — see [`PluginPass`].
 /// The loader pipeline calls this twice (synth pass before Early,
 /// regular pass after booking).
@@ -1055,12 +1105,12 @@ pub fn run_plugins(
                     base_dir.join(name)
                 };
 
-                // Path security: prevent plugins from outside the ledger directory
-                if options.path_security
-                    && let (Ok(canon_base), Ok(canon_plugin)) =
-                        (base_dir.canonicalize(), resolved.canonicalize())
-                    && !canon_plugin.starts_with(&canon_base)
-                {
+                // Path security: prevent plugins from outside the ledger
+                // directory. `plugin_path_within_base` canonicalizes when the
+                // file exists (symlink-safe) and otherwise normalizes `..`
+                // lexically — so it fails CLOSED instead of skipping the check
+                // when canonicalize errors (the old fail-open hole).
+                if options.path_security && !plugin_path_within_base(&resolved, base_dir) {
                     return Err(format!(
                         "plugin path '{name}' is outside the ledger directory"
                     ));
@@ -1853,6 +1903,50 @@ mod sanitize_tests {
         });
         sanitize_inner_posting_spans(&mut d, &sm); // no panic, no change
         assert!(matches!(d, Directive::Open(_)));
+    }
+}
+
+#[cfg(all(test, feature = "plugins"))]
+mod plugin_path_security_tests {
+    use super::{lexically_normalize, plugin_path_within_base};
+    use std::path::Path;
+
+    #[test]
+    fn lexically_normalize_resolves_dotdot_for_nonexistent_paths() {
+        // The whole point: it works without the path existing on disk.
+        assert_eq!(
+            lexically_normalize(Path::new("/ledger/../../etc/passwd")),
+            Path::new("/etc/passwd"),
+        );
+        // `..` at the root is clamped — can't escape above root.
+        assert_eq!(lexically_normalize(Path::new("/../../x")), Path::new("/x"));
+        // `.` segments dropped, structure preserved.
+        assert_eq!(
+            lexically_normalize(Path::new("/ledger/./plugins/p.py")),
+            Path::new("/ledger/plugins/p.py"),
+        );
+    }
+
+    #[test]
+    fn plugin_path_within_base_rejects_traversal_even_when_path_absent() {
+        let base = Path::new("/ledger");
+        // A `..` escape on a path that does NOT exist (canonicalize fails, so the
+        // old `(Ok, Ok)` guard skipped the check entirely) must still be rejected.
+        assert!(!plugin_path_within_base(
+            Path::new("/ledger/../../etc/passwd"),
+            base
+        ));
+        // An in-bounds (also non-existent) path is allowed.
+        assert!(plugin_path_within_base(
+            Path::new("/ledger/plugins/p.py"),
+            base
+        ));
+        // A sibling that merely shares a string prefix is NOT within (component
+        // comparison, not string prefix).
+        assert!(!plugin_path_within_base(
+            Path::new("/ledger-evil/p.py"),
+            base
+        ));
     }
 }
 
