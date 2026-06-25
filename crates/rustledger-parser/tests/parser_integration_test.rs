@@ -1134,3 +1134,42 @@ fn test_reject_unclosed_cost_brace_at_eof() {
             .collect::<Vec<_>>()
     );
 }
+
+/// `parse_without_occurrences` skips the LSP-only occurrence indices but is
+/// otherwise identical to `parse` (the processing path's view). Pins the
+/// optimization that drops ~40k per-token allocations on the load path.
+#[test]
+fn parse_without_occurrences_skips_indices_but_matches_directives() {
+    let src = "2020-01-01 open Assets:Cash USD\n\
+               2020-02-01 * \"p\" \"m\"\n  Assets:Cash 5.00 USD\n  Income:Salary\n";
+    let full = rustledger_parser::parse(src);
+    let lean = rustledger_parser::parse_without_occurrences(src);
+    // Full parse collects occurrences; lean parse does not.
+    assert!(
+        !full.account_occurrences.is_empty() && !full.currency_occurrences.is_empty(),
+        "full parse should collect occurrences"
+    );
+    assert!(
+        lean.account_occurrences.is_empty() && lean.currency_occurrences.is_empty(),
+        "lean parse must skip occurrence collection"
+    );
+    // Everything the processing pipeline consumes must be byte-for-byte
+    // identical — only the occurrence indices differ. Compare full contents
+    // (via Debug), not just counts, so a content regression that preserves
+    // lengths can't slip through.
+    assert_eq!(
+        format!("{:?}", full.directives),
+        format!("{:?}", lean.directives),
+        "directives must be identical"
+    );
+    assert_eq!(
+        format!("{:?}", full.errors),
+        format!("{:?}", lean.errors),
+        "errors must be identical"
+    );
+    assert_eq!(
+        format!("{:?}", full.options),
+        format!("{:?}", lean.options),
+        "options must be identical"
+    );
+}
