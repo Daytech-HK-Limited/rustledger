@@ -495,6 +495,36 @@ fn test_arithmetic_expressions() {
 }
 
 #[test]
+fn test_arithmetic_overflow_yields_null_not_panic() {
+    // Regression (found by the `fuzz_query_execute` fuzzer): BQL `+`/`-`/`*` on
+    // values exceeding rust_decimal's 96-bit range used to panic
+    // ("Multiplication overflowed") instead of yielding NULL like div-by-zero.
+    // `arithmetic_op` now uses the checked operators, so overflow → NULL.
+    let directives = sample_directives();
+    let mut executor = Executor::new(&directives);
+    // A single overflowing operation yields NULL (like div-by-zero).
+    for q in [
+        "SELECT 59999999999000999999990009 * 9999999",
+        "SELECT 79228162514264337593543950335 + 79228162514264337593543950335",
+        "SELECT 0 - 79228162514264337593543950335 - 79228162514264337593543950335",
+    ] {
+        let result = executor.execute(&parse(q).unwrap()).unwrap();
+        assert!(
+            result.rows.iter().all(|r| r[0] == Value::Null),
+            "overflow should yield NULL, not panic, for: {q}"
+        );
+    }
+    // The exact crash input the fuzzer minimized. Here the overflowing `*`
+    // yields NULL which then propagates into further arithmetic, producing a
+    // graceful Type error rather than NULL — the point of this regression is
+    // only that execution must not PANIC (a `rust_decimal` overflow panic would
+    // abort this test). Ok or Err are both acceptable.
+    let _ = executor.execute(
+        &parse("SELECT -899990000999900000+59999999999000999999990009*9999999/99").unwrap(),
+    );
+}
+
+#[test]
 fn test_first_last_aggregates() {
     let directives = sample_directives();
     let mut executor = Executor::new(&directives);
