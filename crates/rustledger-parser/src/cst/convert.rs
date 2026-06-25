@@ -72,6 +72,21 @@ pub fn parse_via_cst(source: &str) -> ParseResult {
 /// collected unconditionally (the processing path needs them).
 #[must_use]
 pub fn parse_via_cst_opts(source: &str, collect_occurrences: bool) -> ParseResult {
+    parse_via_cst_inner(source, collect_occurrences, /* use_green = */ true)
+}
+
+/// Test/fuzz hook: parse like [`crate::parse`] but force the **red** conversion
+/// path (green transaction conversion disabled). Used by the `green_eq_red`
+/// differential fuzz target to assert the green-wired path is output-equivalent.
+#[doc(hidden)]
+#[must_use]
+pub fn parse_red_only(source: &str) -> ParseResult {
+    parse_via_cst_inner(
+        source, /* collect_occurrences = */ true, /* use_green = */ false,
+    )
+}
+
+fn parse_via_cst_inner(source: &str, collect_occurrences: bool, use_green: bool) -> ParseResult {
     // BOM detection mirrors the legacy parser's behavior: strip a
     // leading 3-byte BOM from the source before tokenizing and
     // record its presence in the result. Spans index the original
@@ -183,7 +198,22 @@ pub fn parse_via_cst_opts(source: &str, collect_occurrences: bool) -> ParseResul
             ast::Directive::Pad(node) => convert_pad(&node, bom_offset, &mut errors),
             ast::Directive::Custom(node) => convert_custom(&node, bom_offset, &mut errors),
             ast::Directive::Transaction(node) => {
-                convert_transaction(&node, bom_offset, &mut errors)
+                // Green-tree conversion (no red-node allocation) with a red
+                // fallback for transactions it doesn't yet handle exactly. The
+                // green path returns `Some` only when its output is identical to
+                // red's, so the hybrid is output-equivalent to the pure-red path.
+                let green = node.syntax().green();
+                let base =
+                    u32::from(node.syntax().text_range().start()) as usize + bom_offset as usize;
+                let green_dir = if use_green {
+                    super::green::convert_transaction(&green, base)
+                } else {
+                    None
+                };
+                match green_dir {
+                    Some(d) => Some(d),
+                    None => convert_transaction(&node, bom_offset, &mut errors),
+                }
             }
             ast::Directive::Option(node) => {
                 if let Some(triple) = convert_option(&node, bom_offset) {
@@ -1705,7 +1735,7 @@ fn pushmeta_value(node: &crate::SyntaxNode) -> MetaValue {
 /// Comment-like syntax kinds that the legacy parser surfaces as
 /// `ParseResult.comments` entries when they appear at the top
 /// level (outside any directive's content).
-const fn is_comment_kind(kind: crate::SyntaxKind) -> bool {
+pub(super) const fn is_comment_kind(kind: crate::SyntaxKind) -> bool {
     matches!(
         kind,
         crate::SyntaxKind::COMMENT
@@ -2344,7 +2374,7 @@ fn section_marker_check(
 /// and single-digit month/day. Returns `None` when the token
 /// can't be turned into a real calendar date (invalid month,
 /// invalid day for the given month, etc.).
-fn parse_date_token(text: &str) -> Option<NaiveDate> {
+pub(super) fn parse_date_token(text: &str) -> Option<NaiveDate> {
     // Fast path: canonical "YYYY-MM-DD".
     if text.len() == 10
         && text.as_bytes()[4] == b'-'
@@ -2392,9 +2422,43 @@ fn parse_directive_date(
     None
 }
 
+/// Decode a `STRING` token's text (with surrounding quotes) into its semantic
+/// value: quotes stripped, escapes decoded (`\"`→`"`, `\\`→`\`, `\n`/`\t`/`\r`,
+/// unknown escape drops the backslash). `None` if not a well-formed quoted
+/// string. Text-based so both the red ([`ast::StringLit::text_decoded`]) and
+/// green conversion paths share one source of truth.
+pub(super) fn decode_string_token(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return None;
+    }
+    let raw = &text[1..text.len() - 1];
+    if !raw.contains('\\') {
+        return Some(raw.to_string());
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    Some(out)
+}
+
 /// Parse a numeric token. Tolerates leading sign and thousands-
 /// separator commas (legacy parser drops them).
-fn parse_decimal_token(text: &str) -> Option<Decimal> {
+pub(super) fn parse_decimal_token(text: &str) -> Option<Decimal> {
     use std::str::FromStr;
     let cleaned: String;
     let s = if text.contains(',') {
