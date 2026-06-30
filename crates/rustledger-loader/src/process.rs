@@ -1247,54 +1247,82 @@ fn sanitize_inner_posting_spans(directive: &mut Directive, source_map: &SourceMa
     }
 }
 
-/// Build a [`ValidationOptions`] from loader-level file options.
+/// Map loader [`Options`] to [`rustledger_validate::ValidationOptions`].
 ///
-/// Factored out of the old `run_validation` so both the early and
-/// late phases in `process()` can share the same `ValidationSession`
-/// configuration. Document-dir resolution is relative to the main
-/// file's parent directory.
+/// The single source of truth for the *option-derived* validation settings:
+/// custom account-type names (`name_*`) and the tolerance options
+/// (`inferred_tolerance_default`, `inferred_tolerance_multiplier`,
+/// `infer_tolerance_from_cost`). Path-relative settings (document directories)
+/// and the effective booking method are layered on by callers that hold the
+/// necessary context — see `build_validation_options`.
+///
+/// Both `rledger check` (via `build_validation_options`) and the LSP/MCP
+/// diagnostics path call this, so the two cannot drift. Issue #1648 was exactly
+/// that drift: the LSP built its own `ValidationOptions` that dropped the
+/// tolerance options, so it reported residual errors `check` did not.
 #[cfg(feature = "validation")]
-fn build_validation_options(
-    file_options: &Options,
-    source_map: &SourceMap,
-    default_booking_method: BookingMethod,
+#[must_use]
+pub fn validation_options_from_options(
+    options: &Options,
 ) -> rustledger_validate::ValidationOptions {
-    use rustledger_validate::ValidationOptions;
+    rustledger_validate::ValidationOptions::default()
+        .with_account_types(
+            options
+                .account_types()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        )
+        .with_infer_tolerance_from_cost(options.infer_tolerance_from_cost)
+        .with_tolerance_multiplier(options.inferred_tolerance_multiplier)
+        .with_inferred_tolerance_default(options.inferred_tolerance_default.clone())
+        // File-level `option "booking_method"`. `build_validation_options`
+        // overrides this with the *effective* method (which also honors the
+        // API-level `LoadOptions` default); callers without that override — the
+        // LSP — get the file option, keeping editor diagnostics aligned with
+        // `check` for booking-sensitive balance checks.
+        .with_default_booking_method(
+            options
+                .booking_method
+                .parse()
+                .unwrap_or(BookingMethod::Strict),
+        )
+}
 
-    // Resolve document directories relative to the main file's
-    // directory. Absolute paths pass through; relative paths are
-    // joined onto the source map's first file's parent. Matches the
-    // pre-refactor `run_validation` behavior exactly.
-    let base_dir = source_map
-        .files()
-        .first()
-        .and_then(|f| f.path.parent())
-        .unwrap_or_else(|| std::path::Path::new("."));
-
-    let resolved_document_dirs: Vec<std::path::PathBuf> = file_options
-        .documents
+/// Resolve `documents` option directories to filesystem paths.
+///
+/// Absolute entries pass through; relative entries join onto `base_dir` when it
+/// is `Some`, otherwise are kept as-is (single-file buffers without an on-disk
+/// path). Shared so `check` and the LSP resolve document directories identically.
+#[cfg(feature = "validation")]
+#[must_use]
+pub fn resolve_document_dirs(
+    documents: &[String],
+    base_dir: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    documents
         .iter()
         .map(|d| {
             let path = std::path::Path::new(d);
             if path.is_absolute() {
                 path.to_path_buf()
+            } else if let Some(base) = base_dir {
+                base.join(path)
             } else {
-                base_dir.join(path)
+                path.to_path_buf()
             }
         })
-        .collect();
+        .collect()
+}
 
-    let account_types: Vec<String> = file_options
-        .account_types()
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-
-    // Per-`file_id` source-file directories, so the validator can resolve a
-    // relative `document` path against its own directive's file (matching
-    // Beancount and `include`) instead of the process CWD. `file_id` indexes
-    // `source_map.files()`, so this vec is parallel to it.
-    let document_source_dirs: Vec<std::path::PathBuf> = source_map
+/// Per-`file_id` source-file directories, parallel to `source_map.files()`.
+///
+/// Lets the validator resolve a relative `document` path against its own
+/// directive's file (matching Beancount and `include`) instead of the CWD.
+#[cfg(feature = "validation")]
+#[must_use]
+pub fn document_source_dirs(source_map: &SourceMap) -> Vec<std::path::PathBuf> {
+    source_map
         .files()
         .iter()
         .map(|f| {
@@ -1303,15 +1331,35 @@ fn build_validation_options(
                 std::path::Path::to_path_buf,
             )
         })
-        .collect();
+        .collect()
+}
 
-    ValidationOptions::default()
-        .with_account_types(account_types)
-        .with_document_dirs(resolved_document_dirs)
-        .with_document_source_dirs(document_source_dirs)
-        .with_infer_tolerance_from_cost(file_options.infer_tolerance_from_cost)
-        .with_tolerance_multiplier(file_options.inferred_tolerance_multiplier)
-        .with_inferred_tolerance_default(file_options.inferred_tolerance_default.clone())
+/// Build a [`ValidationOptions`] from loader-level file options.
+///
+/// Layers the path-relative document directories and the *effective* booking
+/// method onto [`validation_options_from_options`] (the shared option-derived
+/// core). Factored out of the old `run_validation` so both the early and late
+/// phases in `process()` share the same `ValidationSession` configuration.
+#[cfg(feature = "validation")]
+fn build_validation_options(
+    file_options: &Options,
+    source_map: &SourceMap,
+    default_booking_method: BookingMethod,
+) -> rustledger_validate::ValidationOptions {
+    // Document dirs resolve against the main file's parent directory (CWD as a
+    // fallback when the source map is empty — matches the pre-refactor behavior).
+    let base_dir = source_map
+        .files()
+        .first()
+        .and_then(|f| f.path.parent())
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    validation_options_from_options(file_options)
+        .with_document_dirs(resolve_document_dirs(
+            &file_options.documents,
+            Some(base_dir),
+        ))
+        .with_document_source_dirs(document_source_dirs(source_map))
         .with_default_booking_method(default_booking_method)
 }
 
@@ -1478,6 +1526,30 @@ fn run_error_to_ledger(e: &rustledger_plugin::PluginRunError) -> LedgerError {
         Rn::PythonFailed { message } => {
             LedgerError::error("E8002", message.clone()).with_phase("plugin")
         }
+    }
+}
+
+#[cfg(all(test, feature = "validation"))]
+mod validation_options_tests {
+    use super::validation_options_from_options;
+    use crate::Options;
+    use rust_decimal_macros::dec;
+
+    /// The shared converter must carry the per-currency tolerance override
+    /// (`inferred_tolerance_default`) and `name_*` account types. This is the
+    /// single source of truth both `check` and the LSP/MCP go through, so they
+    /// cannot drift — issue #1648, where the LSP dropped the tolerance options
+    /// and reported residual errors `check` did not.
+    #[test]
+    fn maps_inferred_tolerance_default_and_account_types() {
+        let mut opts = Options::new();
+        opts.set("inferred_tolerance_default", "CLP:0.5");
+        opts.set("name_assets", "Activos");
+
+        let vo = validation_options_from_options(&opts);
+
+        assert_eq!(vo.inferred_tolerance_default.get("CLP"), Some(&dec!(0.5)));
+        assert_eq!(vo.account_types[0], "Activos");
     }
 }
 

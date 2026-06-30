@@ -69,21 +69,71 @@ pub fn handle_document_link_resolve(link: DocumentLink) -> DocumentLink {
         // Resolve the path
         let resolved_path = resolve_full_path(path, &base_dir);
 
-        // Check if file exists
-        let exists = resolved_path
-            .as_ref()
-            .map(|p| Path::new(p).exists())
-            .unwrap_or(false);
+        // A glob `include` (e.g. `transactions/*.bean`) is valid — the loader
+        // expands it on load — so a literal path-exists check wrongly reports
+        // "File not found" for the pattern (issue #1647). Only `include` paths
+        // are glob-expanded by the loader; `document` paths are always literal
+        // and may legitimately contain `[`/`*`/`?` in real filenames, so never
+        // glob-detect those. `is_glob_pattern` is the loader's own detector,
+        // shared so the two cannot disagree.
+        let is_glob = kind == "include" && rustledger_loader::is_glob_pattern(path);
 
-        // Set target URI
-        if let Some(ref full_path) = resolved_path
+        // For a glob, enumerate matches once: keep only the FIRST match as an
+        // owned String (the clickable target) plus a count — no String-per-match
+        // allocation. `pattern_ok` distinguishes a syntactically invalid pattern
+        // (the loader reports a distinct error) from one that matches nothing.
+        let (glob_first, glob_count, pattern_ok) = if is_glob {
+            match resolved_path.as_ref().map(|p| glob::glob(p)) {
+                Some(Ok(paths)) => {
+                    let mut first = None;
+                    let mut count = 0usize;
+                    for entry in paths.flatten() {
+                        if first.is_none() {
+                            first = Some(entry.to_string_lossy().into_owned());
+                        }
+                        count += 1;
+                    }
+                    (first, count, true)
+                }
+                Some(Err(_)) => (None, 0, false),
+                None => (None, 0, true),
+            }
+        } else {
+            (None, 0, true)
+        };
+
+        let exists = if is_glob {
+            glob_count > 0
+        } else {
+            resolved_path
+                .as_ref()
+                .map(|p| Path::new(p).exists())
+                .unwrap_or(false)
+        };
+
+        // Set target URI. For a glob, point at the first matched file so the
+        // link is still clickable; otherwise the resolved path itself.
+        let target_path = if is_glob {
+            glob_first
+        } else {
+            resolved_path.clone()
+        };
+        if let Some(ref full_path) = target_path
             && let Ok(uri) = format!("file://{}", full_path).parse::<Uri>()
         {
             resolved.target = Some(uri);
         }
 
         // Set tooltip based on existence
-        let tooltip = if exists {
+        let tooltip = if is_glob {
+            if !pattern_ok {
+                format!("⚠ Invalid include pattern: {}", path)
+            } else if exists {
+                format!("Open {} included file(s) matching: {}", glob_count, path)
+            } else {
+                format!("⚠ No files match include pattern: {}", path)
+            }
+        } else if exists {
             match kind {
                 "include" => format!("Open included file: {}", path),
                 "document" => format!("Open document: {}", path),
@@ -307,6 +357,124 @@ mod tests {
         assert!(resolved.tooltip.is_some());
         let tooltip = resolved.tooltip.unwrap();
         assert!(tooltip.contains("not found") || tooltip.contains("Open"));
+    }
+
+    #[test]
+    fn test_document_link_resolve_glob_include() {
+        // #1647: a glob include must not show "File not found" — the loader
+        // expands it on load. With matching files present, the resolved link
+        // reports the match count and stays clickable.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bean"), "").unwrap();
+        std::fs::write(dir.path().join("b.bean"), "").unwrap();
+
+        let link = DocumentLink {
+            range: Range {
+                start: Position::new(0, 9),
+                end: Position::new(0, 20),
+            },
+            target: None,
+            tooltip: None,
+            data: Some(serde_json::json!({
+                "path": "*.bean",
+                "base_dir": dir.path().to_string_lossy(),
+                "kind": "include",
+            })),
+        };
+
+        let resolved = handle_document_link_resolve(link);
+        let tooltip = resolved.tooltip.unwrap();
+        assert!(
+            !tooltip.contains("not found"),
+            "glob include wrongly reported missing: {tooltip}"
+        );
+        assert!(tooltip.contains("matching"), "tooltip: {tooltip}");
+        assert!(
+            resolved.target.is_some(),
+            "glob link should still be clickable"
+        );
+    }
+
+    #[test]
+    fn test_document_link_resolve_glob_no_match() {
+        // A glob that matches nothing is the one case that *should* warn.
+        let dir = tempfile::tempdir().unwrap();
+        let link = DocumentLink {
+            range: Range {
+                start: Position::new(0, 9),
+                end: Position::new(0, 20),
+            },
+            target: None,
+            tooltip: None,
+            data: Some(serde_json::json!({
+                "path": "*.bean",
+                "base_dir": dir.path().to_string_lossy(),
+                "kind": "include",
+            })),
+        };
+        let resolved = handle_document_link_resolve(link);
+        let tooltip = resolved.tooltip.unwrap();
+        assert!(tooltip.contains("No files match"), "tooltip: {tooltip}");
+    }
+
+    #[test]
+    fn test_document_link_resolve_document_with_glob_char_is_literal() {
+        // #1651 review: a `document` whose real filename contains a glob
+        // metacharacter (legal on Linux/macOS) must be treated literally, never
+        // glob-expanded — otherwise an existing document link falsely 404s.
+        let dir = tempfile::tempdir().unwrap();
+        let fname = "Statement[2024-01].pdf";
+        std::fs::write(dir.path().join(fname), "").unwrap();
+
+        let link = DocumentLink {
+            range: Range {
+                start: Position::new(0, 9),
+                end: Position::new(0, 30),
+            },
+            target: None,
+            tooltip: None,
+            data: Some(serde_json::json!({
+                "path": fname,
+                "base_dir": dir.path().to_string_lossy(),
+                "kind": "document",
+            })),
+        };
+        let resolved = handle_document_link_resolve(link);
+        let tooltip = resolved.tooltip.unwrap();
+        // The key assertion: a literal document is NOT glob-detected, so it
+        // resolves as an existing document rather than "no files match". (The
+        // bracketed path won't round-trip through a `file://` URI — a separate,
+        // pre-existing encoding limitation — so we don't assert on `target`.)
+        assert!(
+            tooltip.contains("Open document"),
+            "document with [] in name must resolve literally: {tooltip}"
+        );
+    }
+
+    #[test]
+    fn test_document_link_resolve_invalid_glob_pattern() {
+        // An unbalanced `[` is syntactically invalid — reported as such, not as a
+        // misleading "no files match".
+        let dir = tempfile::tempdir().unwrap();
+        let link = DocumentLink {
+            range: Range {
+                start: Position::new(0, 9),
+                end: Position::new(0, 20),
+            },
+            target: None,
+            tooltip: None,
+            data: Some(serde_json::json!({
+                "path": "foo[.bean",
+                "base_dir": dir.path().to_string_lossy(),
+                "kind": "include",
+            })),
+        };
+        let resolved = handle_document_link_resolve(link);
+        let tooltip = resolved.tooltip.unwrap();
+        assert!(
+            tooltip.contains("Invalid include pattern"),
+            "tooltip: {tooltip}"
+        );
     }
 
     #[test]
