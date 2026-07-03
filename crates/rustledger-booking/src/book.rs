@@ -45,23 +45,6 @@ pub enum BookingError {
     /// Interpolation failed after booking.
     #[error("interpolation failed: {0}")]
     Interpolation(#[from] InterpolationError),
-    /// An AUGMENTING posting carries a cost spec with no number (`{}`,
-    /// `{USD}`, `{2024-01-02}`): the lot's cost basis cannot be
-    /// determined, and booking it uncosted silently corrupts every
-    /// downstream cost read (#1705). Beancount infers the number from
-    /// the transaction residual — until rustledger implements that
-    /// (book-first-interpolate-after), this is a loud error instead of
-    /// a silent wrong booking. Reductions with `{}` (wildcard lot
-    /// match) and `{*}` merge specs are unaffected.
-    #[error(
-        "cost spec on augmenting posting to {account} has no cost amount; \
-         write the cost explicitly (e.g. {{0.90 EUR}}) — inferring it from \
-         the transaction balance is not supported yet (#1705)"
-    )]
-    EmptyCostAugmentation {
-        /// The augmented account.
-        account: rustledger_core::Account,
-    },
 }
 
 /// Result of booking a single transaction.
@@ -432,27 +415,6 @@ impl BookingEngine {
                     }
                 }
 
-                // Guard (#1705): an augmentation whose cost spec has no
-                // number books an UNCOSTED lot via resolve() -> None —
-                // silent corruption of every downstream cost read. Beancount
-                // infers the number from the residual; until that lands,
-                // fail loudly. Reductions never reach here (booked above,
-                // wildcard {} is their lot-match syntax) and merge specs
-                // legitimately carry no number.
-                if !booked_indices.contains(&idx)
-                    && cost_spec.number.is_none()
-                    && !cost_spec.merge
-                    && units.number > rustledger_core::Decimal::ZERO
-                {
-                    // Positive units only: a negative-units `{}` posting that
-                    // didn't classify as a reduction (e.g. empty inventory)
-                    // is reduction INTENT — the Late validator's independent
-                    // lot-matching pass reports those as missing lots, per
-                    // the two-phase design. The silent case is the BUY.
-                    return Err(BookingError::EmptyCostAugmentation {
-                        account: posting.account.clone(),
-                    });
-                }
                 // Fill in dates and currencies for augmentations (not already booked)
                 if !booked_indices.contains(&idx) && cost_spec.number.is_some() {
                     // Cost spec has a number but may be missing date or currency
@@ -1115,6 +1077,59 @@ mod tests {
         assert!(results[1].is_ok());
     }
 
+    /// Issue #1705: an augmenting `{}` lot gets its cost inferred from the
+    /// residual, and a later `{}` reduction of that lot then books cleanly
+    /// (previously the reduction hit a spurious "2 unknowns" error because
+    /// the augmenting lot carried no cost basis to match).
+    #[test]
+    fn test_augmenting_empty_cost_then_reduce() {
+        // buy: 1000 USD {} against -900 EUR  → lot booked at 0.90 EUR/unit
+        let buy = Transaction::new(date(2024, 1, 2), "buy USD")
+            .with_synthesized_posting(
+                Posting::new("Assets:Broker", Amount::new(dec!(1000), "USD"))
+                    .with_cost(CostSpec::empty()),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(-900), "EUR")));
+
+        // sell: -100 USD {} + 95 EUR + PnL residual  → reduce at 0.90, PnL = -5 EUR
+        let sell = Transaction::new(date(2024, 1, 5), "sell part")
+            .with_synthesized_posting(
+                Posting::new("Assets:Broker", Amount::new(dec!(-100.00), "USD"))
+                    .with_cost(CostSpec::empty()),
+            )
+            .with_synthesized_posting(Posting::new("Expenses:Misc", Amount::new(dec!(95), "EUR")))
+            .with_synthesized_posting(Posting::auto("Income:Trading:PnL"));
+
+        let results = book_transactions(&[buy, sell], BookingMethod::Fifo);
+        assert_eq!(results.len(), 2);
+
+        let buy_txn = &results[0].as_ref().expect("buy should book").transaction;
+        let buy_cost = buy_txn.postings[0].cost.as_ref().expect("cost present");
+        assert_eq!(
+            buy_cost
+                .number
+                .as_ref()
+                .and_then(rustledger_core::CostNumber::per_unit),
+            Some(dec!(0.90))
+        );
+        assert_eq!(buy_cost.currency.as_deref(), Some("EUR"));
+
+        // The `{}` reduction booked cleanly and the PnL residual solved to -5 EUR.
+        let sell_txn = &results[1].as_ref().expect("sell should book").transaction;
+        let pnl = sell_txn
+            .postings
+            .iter()
+            .find(|p| p.account.as_str() == "Income:Trading:PnL")
+            .expect("PnL posting present");
+        let pnl_amount = pnl
+            .units
+            .as_ref()
+            .and_then(|u| u.as_amount())
+            .expect("PnL filled");
+        assert_eq!(pnl_amount.number, dec!(-5));
+        assert_eq!(pnl_amount.currency.as_str(), "EUR");
+    }
+
     #[test]
     fn test_book_augmentation_not_reduction() {
         let mut engine = BookingEngine::new();
@@ -1149,14 +1164,16 @@ mod tests {
                 Amount::new(dec!(-750.00), "USD"),
             ));
 
-        // Pre-#1705 this pinned "should not error - just skip lot
-        // matching", which booked the lot UNCOSTED and silently corrupted
-        // every downstream cost read. The interim guard makes it a loud
-        // error until cost-from-residual interpolation lands.
-        let err = engine.book(&another_buy).unwrap_err();
+        // History: originally pinned "should not error - just skip lot
+        // matching" (booked the lot UNCOSTED — silent corruption); the
+        // #1708 interim guard made it a loud error; the #1705 solver now
+        // books it at the residual-inferred cost like beancount. The
+        // engine-level book() leaves the {} spec for interpolation, so
+        // this remains not-an-error with no booked indices.
+        let booked = engine.book(&another_buy).unwrap();
         assert!(
-            err.to_string().contains("no cost amount"),
-            "empty-cost augmentation must error loudly (#1705), got: {err}"
+            booked.booked_indices.is_empty(),
+            "augmentation books via interpolation, not lot matching"
         );
     }
 
