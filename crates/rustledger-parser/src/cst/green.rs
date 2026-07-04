@@ -11,7 +11,7 @@
 //! Status: full transaction conversion (header + postings + cost/price), wired
 //! into `parse_via_cst_opts` with a **red fallback** — green returns `Some` only
 //! when it exactly replicates red, bailing on transaction metadata, direct-child
-//! comments, deprecated `|`, unparseable amounts, and posting flag/metadata/
+//! comments, deprecated `|`, unparsable amounts, and posting flag/metadata/
 //! arithmetic (those layer on next). Measured −16% load on a 10k-txn workload.
 //! Pinned by field-level oracles + the `parse_green_eq_red_corpus` differential
 //! test + the `fuzz_green_eq_red` fuzz target.
@@ -207,7 +207,7 @@ fn simple_amount(node: &rowan::GreenNodeData) -> Option<IncompleteAmount> {
             K::NUMBER if !number_seen => {
                 number_seen = true;
                 number = parse_decimal_token(t.text());
-                // An unparseable NUMBER (e.g. >28 digits) makes red emit a
+                // An unparsable NUMBER (e.g. >28 digits) makes red emit a
                 // diagnostic; bail to red so the error isn't dropped.
                 if number.is_none() {
                     complex = true;
@@ -241,18 +241,27 @@ fn simple_amount(node: &rowan::GreenNodeData) -> Option<IncompleteAmount> {
 
 /// Convert a `COST_SPEC` green node into a `CostSpec` (forms `{N CCY}`,
 /// `{{T CCY}}`, `{N # T CCY}`, `{*}` merge, plus optional date + label). Mirrors
-/// `convert_cost_spec` / `cost_total_after_hash` in [`super::convert`]. Cost
-/// numbers are plain `NUMBER` tokens (no arithmetic evaluation); an unparseable
+/// `convert_cost_spec` / `cost_compound_numbers` in [`super::convert`]. Cost
+/// numbers are plain `NUMBER` tokens (no arithmetic evaluation); an unparsable
 /// one yields `number: None` like red, which emits no diagnostic for cost
 /// numbers — so this needs no bail and always returns a `CostSpec`.
 fn convert_cost_spec(node: &rowan::GreenNodeData) -> CostSpec {
     use crate::SyntaxKind as K;
     let mut is_total = false;
-    let mut first_number: Option<rust_decimal::Decimal> = None;
+    // Red has TWO number semantics and green must carry both (#1713):
+    // - the compound `{a # b}` path (`cost_compound_numbers`) retries past
+    //   UNPARSABLE number tokens on each side of the hash (`is_none()`
+    //   guards re-arm when the parse fails);
+    // - the plain path uses `cs.number()` — the first NUMBER *token*,
+    //   parsed or not (a latch).
+    // Green's old single latched tracker satisfied only the plain path:
+    // on `{<garbage-number> 2 # ...}` red retried to 2 while green kept
+    // None → per_unit 0 (the fuzz_green_eq_red divergence).
+    let mut first_number: Option<rust_decimal::Decimal> = None; // latched (plain path)
     let mut seen_number = false;
+    let mut pre_hash: Option<rust_decimal::Decimal> = None; // retried (compound path)
     let mut past_hash = false;
-    let mut post_hash_seen = false;
-    let mut post_hash_total: Option<rust_decimal::Decimal> = None;
+    let mut post_hash_total: Option<rust_decimal::Decimal> = None; // retried (compound path)
     let mut currency: Option<Currency> = None;
     let mut date: Option<NaiveDate> = None;
     let mut date_seen = false;
@@ -269,21 +278,17 @@ fn convert_cost_spec(node: &rowan::GreenNodeData) -> CostSpec {
             K::L_DOUBLE_BRACE => is_total = true,
             K::NUMBER => {
                 if past_hash {
-                    // Latch the FIRST post-`#` NUMBER token (parsed or not),
-                    // exactly like red's `cost_total_after_hash`, which `return`s
-                    // at the first NUMBER after the hash regardless of whether it
-                    // parses. The old `post_hash_total.is_none()` guard kept
-                    // scanning past an unparseable total and latched a *later*
-                    // number, so green produced `Total{later}` where red yielded
-                    // `None` (→ `PerUnit{first}`) — the `fuzz_green_eq_red`
-                    // divergence on `{N # <unparseable> T}`.
-                    if !post_hash_seen {
-                        post_hash_seen = true;
+                    if post_hash_total.is_none() {
                         post_hash_total = parse_decimal_token(t.text());
                     }
-                } else if !seen_number {
-                    seen_number = true;
-                    first_number = parse_decimal_token(t.text());
+                } else {
+                    if pre_hash.is_none() {
+                        pre_hash = parse_decimal_token(t.text());
+                    }
+                    if !seen_number {
+                        seen_number = true;
+                        first_number = parse_decimal_token(t.text());
+                    }
                 }
             }
             // Mirror red's compound detection (#1700): the hash arms the
@@ -310,7 +315,7 @@ fn convert_cost_spec(node: &rowan::GreenNodeData) -> CostSpec {
         // Compound `{a # b}` as written — mirrors red's
         // `cost_compound_numbers` caller: omitted sides are zero.
         Some(CostNumber::Compound {
-            per_unit: first_number.unwrap_or_default(),
+            per_unit: pre_hash.unwrap_or_default(),
             total: post_hash_total.unwrap_or_default(),
         })
     } else {
@@ -356,7 +361,7 @@ fn cost_is_merge(node: &rowan::GreenNodeData) -> bool {
 
 /// Convert a `PRICE_ANNOTATION` green node into a `PriceAnnotation`: `@@`→Total,
 /// `@`→Unit, with the (non-arithmetic) amount. Returns `None` when the amount is
-/// present but arithmetic/malformed, signalling the caller to bail (later
+/// present but arithmetic/malformed, signaling the caller to bail (later
 /// increment evaluates those).
 fn convert_price_annotation(node: &rowan::GreenNodeData) -> Option<PriceAnnotation> {
     use crate::SyntaxKind as K;
@@ -395,7 +400,7 @@ fn convert_price_annotation(node: &rowan::GreenNodeData) -> Option<PriceAnnotati
 /// Derive the typed [`MetaValue`] of a `META_ENTRY` green node. Mirrors
 /// `meta_value_from_entry` in [`super::convert`] exactly: priority is string >
 /// number/amount > date > account > currency > bool > tag/link > none, and a
-/// type that's present-but-unparseable (e.g. a malformed string, an
+/// type that's present-but-unparsable (e.g. a malformed string, an
 /// over-precision number, a bad date) falls through to the next, matching red.
 fn meta_value(entry: &rowan::GreenNodeData) -> MetaValue {
     use crate::SyntaxKind as K;
@@ -1272,9 +1277,10 @@ mod tests {
             // Regression (fuzz_green_eq_red cost-number): `{N # <X> T}` where the
             // first post-`#` token is a NUMBER that does NOT parse (here
             // `\u{06f6}`, an Arabic-Indic digit the lexer tokenizes as NUMBER but
-            // rust_decimal rejects). Green must latch that FIRST post-hash NUMBER
-            // (-> None -> PerUnit{N}, mirroring red's `cost_total_after_hash`),
-            // NOT scan on to the later parseable `0` and emit `Total{0}`.
+            // rust_decimal rejects). Both sides now RETRY past it to the later
+            // parseable `0` (red's `cost_compound_numbers` is_none() guards;
+            // green mirrors it since #1713) and agree on `Compound{7, 0}` —
+            // this entry pins that they keep agreeing.
             "7046/7/1D\n\tA:F{7#\u{06f6}>0",
             "\u{feff}2020-01-01 * \"p\"\n  A 1 USD\n  B\n", // BOM
             "2020-01-01 * \"é\" \"münts\"\n  Aaa 1 EUR\n  B\n", // multi-byte
