@@ -359,6 +359,31 @@ pub struct LedgerState {
     /// keyed by source identity so a different posting that merely shares an
     /// account/date is still reported.
     pub(crate) account_not_open_early: FxHashSet<(u16, rustledger_core::Span)>,
+    /// Per-posting identities `(file_id, span)` of *explicit* postings whose
+    /// account was absent from `accounts` during the early phase — i.e. the
+    /// deferred half of the account-presence check above. The late phase must
+    /// run the full lifecycle check (`validate_account_lifecycle`) on exactly
+    /// these: by late, `accounts` holds every open in the ledger regardless of
+    /// date, so a use-before-open posting's account IS found and the plain
+    /// presence check passes. Without this set the entire
+    /// use-before-open-by-date class was silently accepted (found by
+    /// `test_account_lifecycle_consistency`): the sorted stream guarantees
+    /// the `open` comes after the offending transaction, so early never saw
+    /// the account and late never re-checked the dates. Postings whose
+    /// account existed early already had their lifecycle checked there —
+    /// re-running it in late would double-report posting-after-close.
+    ///
+    /// Keyed by `(file_id, span, account)`. Synthesized postings (sentinel
+    /// `SYNTHESIZED_FILE_ID` + `Span::ZERO`) are never inserted — their
+    /// shared identity would make one deferred posting's key match every
+    /// synthesized posting to the same account across the ledger,
+    /// double-reporting posting-after-close in late (deep-review catch);
+    /// they stay lifecycle-unchecked like plugin-added postings. The
+    /// account in the key means a posting RENAMED by a regular plugin is
+    /// not re-checked against its new account's dates (pre-rename key ≠
+    /// post-rename key) — unchanged from the pre-fix behavior for that
+    /// edge.
+    pub(crate) lifecycle_deferred: FxHashSet<(u16, rustledger_core::Span, Account)>,
     /// Per-`balance`-assertion computed result recorded during Late validation:
     /// `diff = computed − asserted`. Lets consumers render per-assertion pass/fail
     /// without re-deriving the balance (#1663).
@@ -3283,5 +3308,180 @@ mod tests {
         fn _expect_late_finalizes(s: ValidationSession<LateDone>) -> Vec<ValidationError> {
             s.finalize()
         }
+    }
+
+    // ===== Use-before-open lifecycle (the silent-pass class) =====
+    //
+    // A posting dated before its account's `open` always streams BEFORE the
+    // open (directives are date-sorted), so the early phase can't see the
+    // account and the late phase — where `accounts` is fully populated —
+    // used to check presence only. The whole class passed silently
+    // (integration `test_account_lifecycle_consistency`); Python rejects it.
+
+    fn open_at(d: NaiveDate, account: &str) -> Directive {
+        Directive::Open(Open::new(d, account))
+    }
+
+    /// Build a transaction whose postings carry UNIQUE source spans, like
+    /// parsed input. The lifecycle-deferral machinery keys on
+    /// `(file_id, span, account)` and deliberately skips synthesized
+    /// (sentinel-identity) postings, so these tests must not use
+    /// `with_synthesized_posting` or the deferral under test never arms.
+    fn txn_at(d: NaiveDate, postings: Vec<Posting>) -> Directive {
+        let mut t = Transaction::new(d, "t");
+        for (i, p) in postings.into_iter().enumerate() {
+            let start = (d.day() as usize) * 100 + i * 10;
+            t = t.with_posting(rustledger_core::Spanned::new(
+                p,
+                rustledger_core::Span::new(start, start + 9),
+            ));
+        }
+        Directive::Transaction(t)
+    }
+
+    #[test]
+    fn explicit_posting_before_open_is_flagged_exactly_once() {
+        let directives = vec![
+            open_at(date(2020, 1, 1), "Equity:Opening"),
+            txn_at(
+                date(2020, 1, 15),
+                vec![
+                    Posting::new("Assets:Bank", Amount::new(dec!(100), "USD")),
+                    Posting::new("Equity:Opening", Amount::new(dec!(-100), "USD")),
+                ],
+            ),
+            open_at(date(2020, 2, 1), "Assets:Bank"),
+        ];
+        let errors = validate(&directives);
+        let hits: Vec<_> = errors
+            .iter()
+            .filter(|e| e.code == ErrorCode::AccountNotOpen && e.message.contains("Assets:Bank"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "use-before-open must be reported exactly once: {errors:?}"
+        );
+        assert!(
+            hits[0].message.contains("not opened until 2020-02-01"),
+            "error should carry the open date: {}",
+            hits[0].message
+        );
+    }
+
+    #[test]
+    fn elided_posting_before_open_is_flagged_exactly_once() {
+        // The elided leg is reported early (booking needs the account); the
+        // late lifecycle pass must not report it a second time.
+        let directives = vec![
+            open_at(date(2020, 1, 1), "Equity:Opening"),
+            txn_at(
+                date(2020, 1, 15),
+                vec![
+                    Posting {
+                        account: "Assets:Bank".into(),
+                        units: None,
+                        cost: None,
+                        price: None,
+                        flag: None,
+                        meta: Default::default(),
+                        comments: vec![],
+                        trailing_comments: vec![],
+                    },
+                    Posting::new("Equity:Opening", Amount::new(dec!(-100), "USD")),
+                ],
+            ),
+            open_at(date(2020, 2, 1), "Assets:Bank"),
+        ];
+        let errors = validate(&directives);
+        let hits = errors
+            .iter()
+            .filter(|e| e.code == ErrorCode::AccountNotOpen && e.message.contains("Assets:Bank"))
+            .count();
+        assert_eq!(
+            hits, 1,
+            "elided-before-open must not double-report: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn posting_after_close_is_flagged_exactly_once() {
+        // Account existed during early (its open/close stream first), so the
+        // early phase already ran the lifecycle check; the late deferral must
+        // not re-run it and double the AccountClosed error.
+        let directives = vec![
+            open_at(date(2020, 1, 1), "Assets:Bank"),
+            open_at(date(2020, 1, 1), "Equity:Opening"),
+            Directive::Close(Close::new(date(2020, 2, 1), "Assets:Bank")),
+            txn_at(
+                date(2020, 3, 1),
+                vec![
+                    Posting::new("Assets:Bank", Amount::new(dec!(100), "USD")),
+                    Posting::new("Equity:Opening", Amount::new(dec!(-100), "USD")),
+                ],
+            ),
+        ];
+        let errors = validate(&directives);
+        let hits = errors
+            .iter()
+            .filter(|e| e.code == ErrorCode::AccountClosed)
+            .count();
+        assert_eq!(
+            hits, 1,
+            "after-close must be reported exactly once: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn synthesized_postings_are_not_lifecycle_deferred() {
+        // Synthesized postings share the sentinel (SYNTHESIZED_FILE_ID,
+        // Span::ZERO) identity; deferring them would make one key match
+        // every synthesized posting to the same account and double-report
+        // posting-after-close (deep-review catch). They are skipped
+        // instead — a programmatically built use-before-open posting is
+        // NOT reported (documented gap, same class as plugin-added
+        // postings). This test pins the no-error side so a future change
+        // to the deferral consciously revisits the trade-off.
+        let mut t = Transaction::new(date(2020, 1, 15), "synth");
+        t = t.with_synthesized_posting(Posting::new("Assets:Bank", Amount::new(dec!(100), "USD")));
+        t = t.with_synthesized_posting(Posting::new(
+            "Equity:Opening",
+            Amount::new(dec!(-100), "USD"),
+        ));
+        let directives = vec![
+            open_at(date(2020, 1, 1), "Equity:Opening"),
+            Directive::Transaction(t),
+            open_at(date(2020, 2, 1), "Assets:Bank"),
+        ];
+        let errors = validate(&directives);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.code == ErrorCode::AccountNotOpen
+                    && e.message.contains("not opened until")),
+            "synthesized postings must not arm the late lifecycle check: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn posting_on_and_after_open_date_is_clean() {
+        let directives = vec![
+            open_at(date(2020, 1, 1), "Assets:Bank"),
+            open_at(date(2020, 1, 1), "Equity:Opening"),
+            txn_at(
+                date(2020, 1, 1),
+                vec![
+                    Posting::new("Assets:Bank", Amount::new(dec!(100), "USD")),
+                    Posting::new("Equity:Opening", Amount::new(dec!(-100), "USD")),
+                ],
+            ),
+        ];
+        let errors = validate(&directives);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e.code, ErrorCode::AccountNotOpen | ErrorCode::AccountClosed)),
+            "same-date use must be clean: {errors:?}"
+        );
     }
 }
