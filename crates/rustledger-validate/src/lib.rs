@@ -554,27 +554,29 @@ fn validate_phase_inner<D: ValidatableDirective>(
 
     let mut errors = Vec::new();
 
-    // Sort directives by date, then by type priority
-    // (e.g., balance assertions before transactions on the same day).
-    // Parallel sort only for large collections (threading overhead
-    // otherwise).
-    let mut sorted: Vec<&D> = Vec::with_capacity(directives.len());
-    sorted.extend(directives.iter());
-    let sort_fn = |a: &&D, b: &&D| {
-        let ad = a.directive();
-        let bd = b.directive();
-        ad.date()
-            .cmp(&bd.date())
-            .then_with(|| ad.priority().cmp(&bd.priority()))
-            .then_with(|| ad.has_cost_reduction().cmp(&bd.has_cost_reduction()))
-    };
-    if sorted.len() >= PARALLEL_SORT_THRESHOLD {
-        sorted.par_sort_by(sort_fn);
+    // Sort directives into canonical booking order: date, then type
+    // priority (e.g., balance assertions before transactions on the same
+    // day), then the cost-reduction-last tiebreak — the full
+    // `booking_sort_key` tuple, shared with the loader, booking engine,
+    // and LSP. Parallel sort only for large collections (threading
+    // overhead otherwise).
+    // Decorate-sort-undecorate: compute the canonical key ONCE per
+    // directive (O(n)) instead of per comparison (O(n log n)) — the key's
+    // cost-reduction component walks a transaction's postings, and a
+    // comparator recomputes it eagerly even on date mismatches where the
+    // old hand-rolled `then_with` chain short-circuited. Both sorts are
+    // stable, so equal-key directives keep source order exactly as before.
+    let mut keyed: Vec<(_, &D)> = directives
+        .iter()
+        .map(|d| (rustledger_core::booking_sort_key(d.directive()), d))
+        .collect();
+    if keyed.len() >= PARALLEL_SORT_THRESHOLD {
+        keyed.par_sort_by_key(|k| k.0);
     } else {
-        sorted.sort_by(sort_fn);
+        keyed.sort_by_key(|k| k.0);
     }
 
-    for d in sorted {
+    for (_, d) in keyed {
         let directive = d.directive();
         let date = directive.date();
 
