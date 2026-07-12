@@ -2065,3 +2065,185 @@ mod tests {
         assert_eq!(session.info().entries.len(), 0);
     }
 }
+
+// ---- importer interface (3.5.0) ------------------------------------------
+//
+// The `rledger extract` engine over the component boundary (roadmap "import
+// over the component boundary"). Content arrives as bytes from the host —
+// there is no file to read — so extraction goes through the importer crate's
+// content-based entry points (`CsvImporter::extract_string`,
+// `OfxImporter::extract_from_string`). The declarative config is ONE
+// `importers.toml` entry parsed by the canonical
+// `rustledger_importer::toml_entry` schema module shared with the CLI.
+
+use crate::exports::rustledger::ledger::importer as imp;
+use rustledger_importer::csv_importer::CsvImporter;
+use rustledger_importer::{DetectedFormat, OfxImporter, detect_format, toml_entry};
+
+/// Names of built-in importers that recognize the file. Delegates to the
+/// canonical `rustledger_importer::detect_format` — the extension is
+/// authoritative when recognized; the content sniff only decides for
+/// absent/unrecognized extensions (misnamed downloads).
+pub fn import_identify(filename: &str, content: &[u8]) -> Vec<String> {
+    match detect_format(filename, content) {
+        Some(DetectedFormat::Ofx) => vec!["OFX/QFX".to_string()],
+        Some(DetectedFormat::Csv) => vec!["CSV".to_string()],
+        None => Vec::new(),
+    }
+}
+
+/// Infer a CSV mapping; returns an `importers.toml` entry (bare TOML table)
+/// that round-trips into [`import_extract`].
+pub fn import_infer(_filename: &str, content: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(content).map_err(|_| "content is not UTF-8".to_string())?;
+    let inferred = rustledger_importer::csv_inference::infer_csv_config(text)
+        .ok_or_else(|| "content does not look like parseable CSV".to_string())?;
+    toml_entry::entry_toml_from_inferred("inferred", &inferred).map_err(|e| e.to_string())
+}
+
+/// Extract directives from statement bytes using a declarative config entry.
+///
+/// Mirrors the CLI's semantics: `currency` defaults to USD when the entry
+/// omits it (the schema's documented default — the CLI injects it via the
+/// `--currency` flag default), and non-UTF-8 content is decoded lossily so
+/// a Latin-1 OFX 1.x download degrades to replacement characters in text
+/// fields instead of dead-ending a file `identify` just recognized.
+pub fn import_extract(
+    filename: &str,
+    content: &[u8],
+    config: &str,
+) -> Result<imp::ExtractResult, String> {
+    let mut entry = toml_entry::ImporterEntry::from_toml_str(config).map_err(|e| e.to_string())?;
+    if entry.currency.is_none() {
+        entry.currency = Some("USD".to_string());
+    }
+    let text = String::from_utf8_lossy(content);
+
+    let result = if detect_format(filename, content) == Some(DetectedFormat::Ofx) {
+        // OFX needs only account/currency; column mappings don't apply.
+        // `account` is required HERE (not defaulted): the builder would
+        // otherwise silently target Expenses:Unknown, which is wrong for
+        // the asset/liability account a statement belongs to.
+        let Some(ref account) = entry.account else {
+            return Err("OFX extraction requires `account` in the config entry".to_string());
+        };
+        let mut builder = rustledger_importer::ImporterConfig::csv().account(account);
+        if let Some(ref currency) = entry.currency {
+            builder = builder.currency(currency);
+        }
+        let cfg = builder.build().map_err(|e| e.to_string())?;
+        OfxImporter
+            .extract_from_string(&text, &cfg)
+            .map_err(|e| e.to_string())?
+    } else {
+        let cfg = toml_entry::build_config_from_entry(&entry).map_err(|e| e.to_string())?;
+        CsvImporter
+            .extract_string(&text, &cfg)
+            .map_err(|e| e.to_string())?
+    };
+
+    Ok(imp::ExtractResult {
+        entries: result
+            .directives
+            .iter()
+            .map(|d| directive_from_core(d, 0, filename))
+            .collect(),
+        warnings: result.warnings,
+    })
+}
+
+#[cfg(test)]
+mod importer_tests {
+    use super::*;
+
+    const CSV: &str =
+        "Date,Description,Amount\n2026-07-01,Coffee Shop,-4.50\n2026-07-02,Salary,2500.00\n";
+    const OFX: &str = "OFXHEADER:100\nDATA:OFXSGML\n\n<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS>\n<CURDEF>USD\n<BANKTRANLIST>\n<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20260701<TRNAMT>-4.50<FITID>1<NAME>Coffee</STMTTRN>\n</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>\n";
+
+    #[test]
+    fn identify_by_extension_and_sniff() {
+        assert_eq!(import_identify("bank.csv", CSV.as_bytes()), vec!["CSV"]);
+        assert_eq!(import_identify("bank.qfx", OFX.as_bytes()), vec!["OFX/QFX"]);
+        // Misnamed OFX download: content sniff catches it.
+        assert_eq!(
+            import_identify("statement.txt", OFX.as_bytes()),
+            vec!["OFX/QFX"]
+        );
+        // Headerless junk matches nothing.
+        assert!(import_identify("blob.bin", &[0u8, 159, 146, 150]).is_empty());
+    }
+
+    /// The extension is authoritative: a CSV whose narration mentions
+    /// "<OFX" must stay on the CSV path (review finding — the sniff must
+    /// not override an explicit extension).
+    #[test]
+    fn csv_extension_beats_ofx_looking_content() {
+        let csv = "Date,Description,Amount\n2026-07-01,REFUND <OFX PORTAL>,-4.50\n";
+        assert_eq!(import_identify("bank.csv", csv.as_bytes()), vec!["CSV"]);
+        let config = "name = \"x\"\naccount = \"Assets:Bank\"\ndate_column = \"Date\"\nnarration_column = \"Description\"\namount_column = \"Amount\"\n";
+        let result = import_extract("bank.csv", csv.as_bytes(), config).expect("CSV path");
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    /// Currency defaults to USD (the schema's documented default), so an
+    /// entry with only account works over the component exactly like the
+    /// CLI, where the --currency flag default supplies it.
+    #[test]
+    fn currency_defaults_to_usd() {
+        let config = "name = \"ofx\"\naccount = \"Assets:Checking\"\n";
+        let result = import_extract("bank.ofx", OFX.as_bytes(), config).expect("extracts");
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    /// Latin-1 OFX (CHARSET:1252, the OFX 1.x default many banks emit) is
+    /// decoded lossily instead of dead-ending a file identify recognized.
+    #[test]
+    fn latin1_ofx_extracts_lossily() {
+        let mut bytes = OFX.replace("Coffee", "Entr~e").into_bytes();
+        let idx = bytes.iter().position(|&b| b == b'~').expect("marker");
+        bytes[idx] = 0xE9; // \u{e9} in Latin-1 (Entree with an accent) — invalid UTF-8
+        assert_eq!(import_identify("bank.ofx", &bytes), vec!["OFX/QFX"]);
+        let config = "name = \"ofx\"\naccount = \"Assets:Checking\"\ncurrency = \"USD\"\n";
+        let result = import_extract("bank.ofx", &bytes, config).expect("lossy decode extracts");
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    /// The infer -> extract loop a GUI host runs: infer a mapping, append
+    /// account/currency, extract with it.
+    #[test]
+    fn infer_round_trips_into_extract() {
+        let config = import_infer("bank.csv", CSV.as_bytes()).expect("inferable");
+        let config = format!("{config}account = \"Assets:Bank\"\ncurrency = \"USD\"\n");
+        let result = import_extract("bank.csv", CSV.as_bytes(), &config).expect("extracts");
+        assert_eq!(result.entries.len(), 2);
+        let wit::Directive::Transaction(txn) = &result.entries[0] else {
+            panic!("expected a transaction");
+        };
+        assert!(txn.postings.iter().any(|p| p.account == "Assets:Bank"));
+        // Extracted entries carry the statement filename as provenance.
+        assert_eq!(txn.meta.filename, "bank.csv");
+    }
+
+    #[test]
+    fn extract_ofx_needs_only_account_and_currency() {
+        let config = "name = \"ofx\"\naccount = \"Assets:Checking\"\ncurrency = \"USD\"\n";
+        let result = import_extract("bank.ofx", OFX.as_bytes(), config).expect("extracts");
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    /// OFX without `account` is an error, not a silent import into the
+    /// builder's Expenses:Unknown default (review comment).
+    #[test]
+    fn extract_ofx_without_account_is_rejected() {
+        let err =
+            import_extract("bank.ofx", OFX.as_bytes(), "name = \"ofx\"").expect_err("rejects");
+        assert!(err.contains("account"), "{err}");
+    }
+
+    #[test]
+    fn extract_rejects_malformed_config() {
+        assert!(import_extract("bank.csv", CSV.as_bytes(), "not = [valid").is_err());
+        // Missing `name` is a schema violation, same as the CLI.
+        assert!(import_extract("bank.csv", CSV.as_bytes(), "account = \"Assets:Bank\"").is_err());
+    }
+}

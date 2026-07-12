@@ -912,3 +912,84 @@ fn load_file_decrypts_via_host_import() -> Result<()> {
     );
     Ok(())
 }
+
+/// The `importer` interface (3.5.0) over the real component: identify a CSV,
+/// infer its mapping, extract with the inferred config, and agree with the
+/// native `rustledger-importer` engine on the result.
+#[test]
+fn importer_extract_matches_native_engine() -> Result<()> {
+    if !component_path().exists() {
+        eprintln!("skip: component wasm not built");
+        return Ok(());
+    }
+    const CSV: &str =
+        "Date,Description,Amount\n2026-07-01,Coffee Shop,-4.50\n2026-07-02,Salary,2500.00\n";
+    let (mut store, inst) = instantiate()?;
+    let importer = inst.rustledger_ledger_importer();
+
+    let names = importer.call_identify(&mut store, "bank.csv", CSV.as_bytes())?;
+    assert_eq!(names, vec!["CSV".to_string()]);
+
+    let config = importer
+        .call_infer(&mut store, "bank.csv", CSV.as_bytes())?
+        .expect("CSV is inferable");
+    let config = format!("{config}account = \"Assets:Bank\"\ncurrency = \"USD\"\n");
+    let result = importer
+        .call_extract(&mut store, "bank.csv", CSV.as_bytes(), &config)?
+        .expect("extraction succeeds");
+
+    // Native engine on the same content + config — the drift guard.
+    let entry = rustledger_importer::toml_entry::ImporterEntry::from_toml_str(&config)?;
+    let native_cfg = rustledger_importer::toml_entry::build_config_from_entry(&entry)?;
+    let native = rustledger_importer::csv_importer::CsvImporter.extract_string(CSV, &native_cfg)?;
+
+    // Compare the exact observables (date, narration, postings), not just
+    // counts — a count-only guard is decoration per the drift-guard rule.
+    fn wit_shape(
+        d: &rustledger::ledger::types::Directive,
+    ) -> (String, String, Vec<(String, String)>) {
+        let rustledger::ledger::types::Directive::Transaction(t) = d else {
+            panic!("expected transaction, got {d:?}");
+        };
+        (
+            t.date.clone(),
+            t.narration.clone().unwrap_or_default(),
+            t.postings
+                .iter()
+                .map(|p| {
+                    let units = p
+                        .units
+                        .as_ref()
+                        .map(|u| format!("{} {}", u.number, u.currency))
+                        .unwrap_or_default();
+                    (p.account.clone(), units)
+                })
+                .collect(),
+        )
+    }
+    fn native_shape(d: &rustledger_core::Directive) -> (String, String, Vec<(String, String)>) {
+        let rustledger_core::Directive::Transaction(t) = d else {
+            panic!("expected transaction, got {d:?}");
+        };
+        (
+            t.date.to_string(),
+            t.narration.to_string(),
+            t.postings
+                .iter()
+                .map(|p| {
+                    let units = p
+                        .amount()
+                        .map(|a| format!("{} {}", a.number, a.currency))
+                        .unwrap_or_default();
+                    (p.account.to_string(), units)
+                })
+                .collect(),
+        )
+    }
+    let component_shapes: Vec<_> = result.entries.iter().map(wit_shape).collect();
+    let native_shapes: Vec<_> = native.directives.iter().map(native_shape).collect();
+    assert_eq!(component_shapes, native_shapes);
+    assert_eq!(component_shapes.len(), 2);
+    assert_eq!(result.warnings, native.warnings);
+    Ok(())
+}
