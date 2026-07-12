@@ -14,7 +14,7 @@
 // `format` (source / file / entry / entries). All exports are implemented in
 // `crates/rustledger-ffi-component`.
 
-package rustledger:ledger@3.5.0;
+package rustledger:ledger@3.6.0;
 
 /// Shared data types, translated 1:1 from `types/output.rs`.
 interface types {
@@ -482,6 +482,17 @@ interface ledger {
     /// Clamp to `[begin, end)`, synthesizing opening-balance and summary
     /// directives at the boundaries.
     clamp: func(begin-date: string, end-date: string) -> list<directive>;
+    /// Flag which candidate entries duplicate one already HELD in this
+    /// session — one bool per candidate, in order (added in 3.6.0 for the
+    /// import review flow). Uses the same fuzzy matcher as
+    /// `rledger extract --existing`: same date, same first-posting amount,
+    /// and similar payee/narration text — so a host review UI and the CLI
+    /// agree on what counts as a duplicate. Living on the session avoids
+    /// re-marshaling the full ledger per import, and the session's
+    /// documented conversion-drop policy (see `from-entries`) covers the
+    /// comparison set. Candidates that fail conversion, and
+    /// non-transaction candidates, are never flagged.
+    dedup: func(candidates: list<directive>) -> list<bool>;
   }
 }
 
@@ -543,7 +554,7 @@ interface util {
 /// Pretty-printing — replaces `format.source` / `format.entries`. Renders
 /// beancount text in canonical form.
 interface format {
-  use types.{input-directive};
+  use types.{directive, input-directive};
 
   /// Canonically reformat beancount source text.
   format-source: func(source: string) -> string;
@@ -554,6 +565,13 @@ interface format {
   /// Render constructed directives to canonical beancount text. Fallible: an
   /// invalid input entry fails the call.
   format-entries: func(entries: list<input-directive>) -> result<string, string>;
+  /// Render LOADED directives (e.g. `importer.extract` output or session
+  /// entries) to canonical beancount text; the loaded->input
+  /// down-conversion (dropping loader-assigned source locations) happens
+  /// inside the component so hosts never reshape directives themselves.
+  /// Added in 3.6.0 alongside `importer.dedup` — it closes the
+  /// extract -> review -> save-to-ledger loop.
+  format-loaded: func(entries: list<directive>) -> result<string, string>;
 }
 
 /// Bank-statement import — the `rledger extract` engine over the component
@@ -562,13 +580,16 @@ interface format {
 /// Sandboxed `.wasm` plugin importers remain a host-side concern — a
 /// component cannot host nested guests.
 interface importer {
-  use types.{directive};
+  use types.{directive, error};
 
   /// Extracted directives plus non-fatal diagnostics (skipped rows etc.).
   /// Entries carry the given statement filename as their source location.
+  /// Warnings use the structured `error` record (severity `warning`, phase
+  /// `extract`) so future line/field attribution is additive rather than a
+  /// record-shape break.
   record extract-result {
     entries: list<directive>,
-    warnings: list<string>,
+    warnings: list<error>,
   }
 
   /// Names of built-in importers that recognize the file. The filename
