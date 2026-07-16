@@ -57,20 +57,30 @@ const PARSE_STACK_SIZE: usize = 16 * 1024 * 1024;
 /// Byte offset at which parenthesis nesting first exceeds
 /// [`MAX_NESTING_DEPTH`], or `None` if the input stays within the bound.
 ///
-/// Parens inside string literals (`"..."` / `'...'`, with `\` escapes)
-/// are skipped so they don't count — matching the grammar, which treats
-/// them as opaque string bytes rather than expression delimiters.
+/// Parens inside string literals (`"..."` / `'...'`) are skipped so they
+/// don't count — matching the grammar, which treats them as opaque string
+/// bytes rather than expression delimiters. String lexing here MUST agree
+/// with [`string_literal`] (upstream semantics, #1797): backslash is an
+/// ordinary byte (never an escape), and `''` continues a single-quoted
+/// string. Pinned by the MAX_NESTING_DEPTH-straddling guards in
+/// `string_literal_escapes_test.rs`. (A third, DELIBERATELY divergent
+/// string scanner exists: `completions::tokenize_bql`, a heuristic
+/// completion-context tokenizer that only understands double quotes —
+/// see its doc comment for the divergence rationale.)
 fn nesting_exceeds_limit(source: &str) -> Option<usize> {
     let mut depth: usize = 0;
-    let mut chars = source.char_indices();
+    let mut chars = source.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         match c {
             '"' | '\'' => {
                 // Consume the string body so its parens don't count.
                 while let Some((_, sc)) = chars.next() {
-                    if sc == '\\' {
-                        chars.next(); // skip the escaped char
-                    } else if sc == c {
+                    if sc == c {
+                        // `''` continues a single-quoted string.
+                        if c == '\'' && chars.peek().is_some_and(|&(_, n)| n == '\'') {
+                            chars.next();
+                            continue;
+                        }
                         break;
                     }
                 }
@@ -1044,24 +1054,45 @@ fn table_identifier<'a>() -> impl Parser<'a, ParserInput<'a>, String, ParserExtr
 }
 
 /// Parse a string literal.
+///
+/// Upstream beanquery's grammar is quote-stripping ONLY (#1797):
+///
+/// ```text
+/// string = /\"[^\"]*\"|\'(?:[^\']|\'\')*\'/    (bql.ebnf)
+/// def string(value): return value[1:-1]        (parser semantics)
+/// ```
+///
+/// A backslash is an ordinary byte — `'\)'` must reach `subst()` as the
+/// two characters `\)`, not be collapsed to `)` (which turns a valid
+/// regex into "unopened group"). A doubled `''` lets a single-quoted
+/// string continue past a quote but is kept VERBATIM — upstream's own
+/// `parser_test.py` pins `'rainy''day'` -> `rainy''day`. Double-quoted
+/// strings have no escapes at all and end at the first `"`.
 fn string_literal<'a>() -> impl Parser<'a, ParserInput<'a>, String, ParserExtra<'a>> + Clone {
-    // Double-quoted string
+    // Double-quoted string: body is everything up to the first `"`,
+    // captured as one input slice like the single-quoted arm.
     let double_quoted = just('"')
         .ignore_then(
-            none_of("\"\\")
-                .or(just('\\').ignore_then(any()))
+            none_of("\"")
+                .ignored()
                 .repeated()
-                .collect::<String>(),
+                .to_slice()
+                .map(ToString::to_string),
         )
         .then_ignore(just('"'));
 
-    // Single-quoted string (SQL-style)
+    // Single-quoted string (SQL-style): `''` continues the string (and
+    // stays as-is in the value); anything else ends at the first `'`.
+    // The body is captured as one input slice (`to_slice`) — the value
+    // is verbatim anyway, so no per-piece assembly is needed.
     let single_quoted = just('\'')
         .ignore_then(
-            none_of("'\\")
-                .or(just('\\').ignore_then(any()))
+            just("''")
+                .ignored()
+                .or(none_of("'").ignored())
                 .repeated()
-                .collect::<String>(),
+                .to_slice()
+                .map(ToString::to_string),
         )
         .then_ignore(just('\''));
 
