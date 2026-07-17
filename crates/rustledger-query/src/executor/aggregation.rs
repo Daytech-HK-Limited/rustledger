@@ -30,6 +30,12 @@ impl<'a> Executor<'a> {
             }
             Expr::UnaryOp(op) => Self::is_aggregate_expr(&op.operand),
             Expr::Paren(inner) => Self::is_aggregate_expr(inner),
+            // A postfix access over an aggregate (first(entry).payee) is
+            // itself aggregate — without this the query is misrouted down
+            // the per-row path and silently returns NULL rows (#1800 review).
+            Expr::Attribute { operand, .. } | Expr::Subscript { operand, .. } => {
+                Self::is_aggregate_expr(operand)
+            }
             _ => false,
         }
     }
@@ -262,6 +268,12 @@ impl<'a> Executor<'a> {
         group: &[&PostingContext],
     ) -> Result<Value, QueryError> {
         match expr {
+            Expr::Attribute { operand, name } => {
+                Self::eval_attribute(self.evaluate_aggregate_expr(operand, group)?, name)
+            }
+            Expr::Subscript { operand, key } => {
+                Self::eval_subscript(&self.evaluate_aggregate_expr(operand, group)?, key)
+            }
             Expr::Function(func) => {
                 match func.name.to_uppercase().as_str() {
                     "COUNT" => {
@@ -598,6 +610,14 @@ impl<'a> Executor<'a> {
         group: &[&PostingContext],
     ) -> Result<Value, QueryError> {
         match expr {
+            Expr::Attribute { operand, name } => Self::eval_attribute(
+                self.evaluate_having_expr(operand, row, col_map, alias_map, group)?,
+                name,
+            ),
+            Expr::Subscript { operand, key } => Self::eval_subscript(
+                &self.evaluate_having_expr(operand, row, col_map, alias_map, group)?,
+                key,
+            ),
             Expr::Column(name) => {
                 let upper_name = name.to_uppercase();
                 // Try alias first, then column name
@@ -686,6 +706,14 @@ impl<'a> Executor<'a> {
         column_map: &rustc_hash::FxHashMap<String, usize>,
     ) -> Result<Value, QueryError> {
         match expr {
+            Expr::Attribute { operand, name } => Self::eval_attribute(
+                self.evaluate_aggregate_table_expr(operand, group, column_map)?,
+                name,
+            ),
+            Expr::Subscript { operand, key } => Self::eval_subscript(
+                &self.evaluate_aggregate_table_expr(operand, group, column_map)?,
+                key,
+            ),
             Expr::Function(func) => {
                 match func.name.to_uppercase().as_str() {
                     "COUNT" => {
@@ -953,6 +981,18 @@ impl<'a> Executor<'a> {
         column_map: &rustc_hash::FxHashMap<String, usize>,
     ) -> Result<Value, QueryError> {
         match expr {
+            Expr::Attribute { operand, name } => Self::eval_attribute(
+                self.evaluate_having_table_expr(
+                    operand, row, col_map, alias_map, group, column_map,
+                )?,
+                name,
+            ),
+            Expr::Subscript { operand, key } => Self::eval_subscript(
+                &self.evaluate_having_table_expr(
+                    operand, row, col_map, alias_map, group, column_map,
+                )?,
+                key,
+            ),
             Expr::Column(name) => {
                 let upper_name = name.to_uppercase();
                 if let Some(&idx) = alias_map.get(&upper_name) {

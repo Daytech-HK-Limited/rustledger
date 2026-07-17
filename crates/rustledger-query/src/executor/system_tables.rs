@@ -583,6 +583,9 @@ impl Executor<'_> {
             // Metadata and collection columns
             "meta".to_string(),
             "accounts".to_string(),
+            // Parent transaction as a structured object (entry.meta etc.,
+            // #1796) — same canonical builder as the default-path column.
+            "entry".to_string(),
             // Hidden metadata columns for META/ENTRY_META functions
             "_entry_meta".to_string(),
             "_posting_meta".to_string(),
@@ -599,6 +602,12 @@ impl Executor<'_> {
             .expect("scan_postings(None, None, ..) evaluates no predicates, so it cannot fail")
             .postings;
 
+        // Entry objects are per-TRANSACTION; postings of one transaction are
+        // contiguous in the scan, so memoize the last built object instead of
+        // rebuilding (strings, tags/links vectors, full meta conversion) for
+        // every posting (#1800 review).
+        let mut last_entry: Option<(usize, Value)> = None;
+
         for ctx in contexts {
             let txn = ctx.transaction;
             let posting = &txn.postings[ctx.posting_index];
@@ -609,6 +618,15 @@ impl Executor<'_> {
 
             // Transaction-level location — the per-posting fallback below.
             let source_loc = self.get_source_location(dir_idx);
+
+            let entry_val = match &last_entry {
+                Some((idx, value)) if *idx == dir_idx => value.clone(),
+                _ => {
+                    let value = Self::entry_object(txn, source_loc);
+                    last_entry = Some((dir_idx, value.clone()));
+                    value
+                }
+            };
 
             let tags: Vec<String> = txn.tags.iter().map(ToString::to_string).collect();
             let links: Vec<String> = txn.links.iter().map(ToString::to_string).collect();
@@ -753,6 +771,7 @@ impl Executor<'_> {
                     posting_loc.as_ref(),
                 ))),
                 Value::StringSet(all_accounts),
+                entry_val,
                 // Hidden metadata columns
                 Self::metadata_to_value(&txn.meta),
                 Self::metadata_to_value(&posting.meta),
