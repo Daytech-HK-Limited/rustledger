@@ -117,7 +117,13 @@ impl AlphaVantageSource {
         let price = Decimal::from_str(price_str)
             .with_context(|| format!("Failed to parse price: {price_str}"))?;
 
-        let date = jiff::Zoned::now().date();
+        // The quote's OWN trading day when present — a weekend fetch must
+        // date the price Friday, not today (deep review of #1801).
+        let date = super::feed_date_or_today(
+            quote
+                .get("07. latest trading day")
+                .and_then(serde_json::Value::as_str),
+        );
 
         Ok(PriceResponse {
             price,
@@ -129,8 +135,20 @@ impl AlphaVantageSource {
 
     fn fetch_forex(&self, from: &str, to: &str, api_key: &str) -> Result<PriceResponse> {
         let url = self.build_forex_url(from, to, api_key);
+        self.fetch_exchange_rate(&url, from, to)
+    }
 
-        let mut response = ureq::get(&url)
+    fn fetch_crypto(&self, symbol: &str, market: &str, api_key: &str) -> Result<PriceResponse> {
+        let url = self.build_crypto_url(symbol, market, api_key);
+        self.fetch_exchange_rate(&url, symbol, market)
+    }
+
+    /// Shared `CURRENCY_EXCHANGE_RATE` fetch — forex and crypto hit the
+    /// same endpoint and parse the same response shape (round-2 deep
+    /// review: the two copies had drifted, keeping the local-clock date
+    /// label in both while the stock path was fixed).
+    fn fetch_exchange_rate(&self, url: &str, from: &str, to: &str) -> Result<PriceResponse> {
+        let mut response = ureq::get(url)
             .header("User-Agent", user_agent())
             .call()
             .with_context(|| format!("Failed to fetch rate for {from}/{to}"))?;
@@ -152,46 +170,19 @@ impl AlphaVantageSource {
         let price = Decimal::from_str(price_str)
             .with_context(|| format!("Failed to parse rate: {price_str}"))?;
 
-        let date = jiff::Zoned::now().date();
+        // The quote's OWN refresh day when present ("6. Last Refreshed"
+        // is "YYYY-MM-DD HH:MM:SS" in UTC) — a weekend FX fetch returns
+        // Friday's rate and must be dated Friday, not today (#1794
+        // class; round-2 deep review).
+        let date = super::feed_date_or_today(
+            rate_data
+                .get("6. Last Refreshed")
+                .and_then(serde_json::Value::as_str),
+        );
 
         Ok(PriceResponse {
             price,
             currency: to.to_string(),
-            date,
-            source: self.name().to_string(),
-        })
-    }
-
-    fn fetch_crypto(&self, symbol: &str, market: &str, api_key: &str) -> Result<PriceResponse> {
-        let url = self.build_crypto_url(symbol, market, api_key);
-
-        let mut response = ureq::get(&url)
-            .header("User-Agent", user_agent())
-            .call()
-            .with_context(|| format!("Failed to fetch crypto price for {symbol}"))?;
-
-        let json: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .with_context(|| "Failed to parse Alpha Vantage response")?;
-
-        let rate_data = json
-            .get("Realtime Currency Exchange Rate")
-            .with_context(|| "Missing crypto price data")?;
-
-        let price_str = rate_data
-            .get("5. Exchange Rate")
-            .and_then(serde_json::Value::as_str)
-            .with_context(|| "Missing crypto price")?;
-
-        let price = Decimal::from_str(price_str)
-            .with_context(|| format!("Failed to parse price: {price_str}"))?;
-
-        let date = jiff::Zoned::now().date();
-
-        Ok(PriceResponse {
-            price,
-            currency: market.to_string(),
             date,
             source: self.name().to_string(),
         })
@@ -216,6 +207,10 @@ impl PriceSource for AlphaVantageSource {
     }
 
     fn fetch_price(&self, request: &PriceRequest) -> Result<PriceResponse> {
+        // Latest-only source: a historical --date must refuse, not
+        // mislabel the current quote (#1794).
+        super::reject_historical_date(self.name(), request)?;
+
         let api_key = Self::get_api_key()?;
         self.fetch_internal(request, &api_key)
     }

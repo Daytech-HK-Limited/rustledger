@@ -42,16 +42,23 @@ impl PriceSource for RatesApiSource {
     }
 
     fn fetch_price(&self, request: &PriceRequest) -> Result<PriceResponse> {
-        // If ticker and currency are the same, return 1.0
+        // Identity rate: 1.0 is correct for any PAST date, so this
+        // branch deliberately sits ABOVE the latest-only guard (deep
+        // review — the guard must not remove previously-correct dated
+        // identity answers). Future labels are refused by
+        // identity_label_date (round-4 review).
         if request.ticker.to_uppercase() == request.currency.to_uppercase() {
-            let date = request.date.unwrap_or_else(|| jiff::Zoned::now().date());
             return Ok(PriceResponse {
                 price: Decimal::ONE,
                 currency: request.currency.clone(),
-                date,
+                date: super::identity_label_date(self.name(), request)?,
                 source: self.name().to_string(),
             });
         }
+
+        // Latest-only source: a historical --date must refuse, not
+        // mislabel the current quote (#1794).
+        super::reject_historical_date(self.name(), request)?;
 
         let url = self.build_url(
             &request.ticker.to_uppercase(),
@@ -95,7 +102,10 @@ impl PriceSource for RatesApiSource {
         let price = crate::cmd::price::price_decimal_from_json(rate_value)
             .with_context(|| format!("Invalid rate format: {rate_value}"))?;
 
-        let date = request.date.unwrap_or_else(|| jiff::Zoned::now().date());
+        // The feed's OWN quote date when present (exchangerate.host
+        // returns a "date" field) — on weekends the latest rate belongs
+        // to Friday and must say so (deep review, same rule as ECB).
+        let date = super::feed_date_or_today(json.get("date").and_then(serde_json::Value::as_str));
 
         Ok(PriceResponse {
             price,

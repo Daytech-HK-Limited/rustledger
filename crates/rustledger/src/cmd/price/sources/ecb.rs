@@ -94,7 +94,7 @@ impl EcbSource {
             .with_context(|| format!("Failed to parse rate: {rate_value}"))?;
 
         // Try to get the date from the structure
-        let date = json
+        let date_str = json
             .get("structure")
             .and_then(|s| s.get("dimensions"))
             .and_then(|d| d.get("observation"))
@@ -107,9 +107,8 @@ impl EcbSource {
                 values.get(idx)
             })
             .and_then(|v| v.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|s| s.parse::<NaiveDate>().ok())
-            .unwrap_or_else(|| jiff::Zoned::now().date());
+            .and_then(serde_json::Value::as_str);
+        let date = super::feed_date_or_today(date_str);
 
         Ok((rate, date))
     }
@@ -134,17 +133,23 @@ impl PriceSource for EcbSource {
         // 2. ticker=X, currency=EUR: fetch X rate, invert it (EUR per X)
         // 3. ticker=X, currency=Y: fetch both, compute cross-rate (Y per X)
 
-        let date = request.date.unwrap_or_else(|| jiff::Zoned::now().date());
-
-        if ticker == "EUR" && currency == "EUR" {
-            // EUR to EUR = 1
+        // Identity rate: 1.0 is correct for ANY pair and any PAST date
+        // (the pre-#1801 cross-rate path answered USD/USD = rate/rate
+        // = 1 for dated requests too), so this branch deliberately sits
+        // ABOVE the latest-only guard — same shape as ratesapi. Future
+        // labels are refused by identity_label_date (round-4 review).
+        if ticker == currency {
             return Ok(PriceResponse {
                 price: Decimal::ONE,
                 currency,
-                date,
+                date: super::identity_label_date(self.name(), request)?,
                 source: self.name().to_string(),
             });
         }
+
+        // Latest-only source: a historical --date must refuse, not
+        // mislabel the current quote (#1794).
+        super::reject_historical_date(self.name(), request)?;
 
         if ticker == "EUR" {
             // EUR -> X: fetch X rate (X per EUR), return as-is
@@ -152,7 +157,10 @@ impl PriceSource for EcbSource {
             return Ok(PriceResponse {
                 price: rate,
                 currency,
-                date: request.date.unwrap_or(rate_date),
+                // The ECB feed's OWN reference date — never the requested one:
+                // on weekends/holidays the latest rate is Friday's and must
+                // be labeled as such (#1794).
+                date: rate_date,
                 source: self.name().to_string(),
             });
         }
@@ -167,7 +175,10 @@ impl PriceSource for EcbSource {
             return Ok(PriceResponse {
                 price: inverted,
                 currency,
-                date: request.date.unwrap_or(rate_date),
+                // The ECB feed's OWN reference date — never the requested one:
+                // on weekends/holidays the latest rate is Friday's and must
+                // be labeled as such (#1794).
+                date: rate_date,
                 source: self.name().to_string(),
             });
         }
@@ -175,7 +186,40 @@ impl PriceSource for EcbSource {
         // Cross-rate: X -> Y via EUR
         // X per EUR and Y per EUR => Y per X = (Y per EUR) / (X per EUR)
         let (ticker_rate, ticker_date) = self.fetch_rate(&ticker)?;
-        let (currency_rate, _) = self.fetch_rate(&currency)?;
+        let (currency_rate, currency_date) = self.fetch_rate(&currency)?;
+
+        // The two legs are separate fetches of a once-daily feed; if they
+        // reference different days, dividing a Monday rate by a Friday
+        // rate yields a number that is not a valid rate for ANY date.
+        // Refuse rather than emit a silently corrupted directive
+        // (round-2 deep review — min() labeling was not sound). Two
+        // causes: a transient publication straddle (gap of a day or a
+        // weekend) and a permanently frozen series — the ECB stops
+        // publishing discontinued currencies (HRK, RUB) but keeps
+        // serving their final observation, so a large gap gets the
+        // permanent diagnosis instead of useless "retry" advice
+        // (rounds 3-4 deep review).
+        if ticker_date != currency_date {
+            let (older_date, older_ccy) = if ticker_date < currency_date {
+                (ticker_date, &ticker)
+            } else {
+                (currency_date, &currency)
+            };
+            let gap_days = (ticker_date - currency_date).get_days().abs();
+            if gap_days > 5 {
+                anyhow::bail!(
+                    "ECB's {older_ccy} series is frozen at {older_date} — the ECB \
+                     no longer publishes it (discontinued currency); use a \
+                     different price source for {older_ccy}"
+                );
+            }
+            anyhow::bail!(
+                "ECB returned different reference dates for the two legs of \
+                 {ticker}/{currency} ({ticker_date} vs {currency_date}) — the \
+                 fetches likely straddled the daily ~16:00 CET publication; \
+                 retry shortly"
+            );
+        }
 
         if ticker_rate.is_zero() {
             anyhow::bail!("Cannot compute cross-rate: zero rate for {ticker}");
@@ -186,7 +230,9 @@ impl PriceSource for EcbSource {
         Ok(PriceResponse {
             price: cross_rate,
             currency,
-            date: request.date.unwrap_or(ticker_date),
+            // Same rule as the direct branches: the feed's own reference
+            // date (both legs agree — checked above).
+            date: ticker_date,
             source: self.name().to_string(),
         })
     }
@@ -219,5 +265,20 @@ mod tests {
         let response = source.fetch_price(&request).unwrap();
         assert_eq!(response.price, Decimal::ONE);
         assert_eq!(response.currency, "EUR");
+    }
+
+    /// Any identity pair — not just EUR/EUR — answers 1.0 for any
+    /// requested date without network access. The pre-#1801 cross-rate
+    /// path gave dated USD/USD = 1 too; the latest-only guard must not
+    /// remove that (round-2 deep review).
+    #[test]
+    fn dated_non_eur_identity_returns_one() {
+        let source = EcbSource::new(Duration::from_secs(30));
+        let date = rustledger_core::naive_date(2024, 6, 30).unwrap();
+        let mut request = PriceRequest::new("USD", "USD");
+        request.date = Some(date);
+        let response = source.fetch_price(&request).unwrap();
+        assert_eq!(response.price, Decimal::ONE);
+        assert_eq!(response.date, date);
     }
 }
