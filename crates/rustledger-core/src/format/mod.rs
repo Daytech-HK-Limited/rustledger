@@ -10,7 +10,7 @@ mod helpers;
 mod transaction;
 
 pub use align::{Alignment, FormatLine, render_lines, resolve_alignment};
-pub(crate) use amount::{format_amount, format_cost_spec, format_price_annotation};
+pub(crate) use amount::{format_amount_with, format_cost_spec, format_price_annotation};
 use directives::{
     format_balance_lines, format_close_lines, format_commodity_lines, format_custom_lines,
     format_document_lines, format_event_lines, format_note_lines, format_open_lines,
@@ -31,6 +31,22 @@ pub struct FormatConfig {
     pub alignment: Alignment,
     /// Indentation for postings and metadata (default: 2 spaces).
     pub indent: String,
+    /// Optional number rendering context (#1766): when set, amount,
+    /// cost, price, tolerance, and amount-typed metadata numbers render
+    /// through [`crate::DisplayContext::format_plain`] — per-currency
+    /// PRECISION padding (`option "display_precision"`, observed
+    /// distributions) that never rounds an over-precise value away
+    /// (quantizing a balance amount would change its meaning), and
+    /// leaves currencies the context does not track byte-faithful to
+    /// their own scale. Thousands separators are deliberately never
+    /// emitted even when the context has `render_commas` set: canonical
+    /// ledger text carries no separators (the CST canonicalizer strips
+    /// them by definition, matching `bean-format`) — commas remain a
+    /// report/query display concern, honored where they always were.
+    /// `None` preserves each value's own scale byte-for-byte (the
+    /// historical behavior, and what source-preserving formatters
+    /// want).
+    pub number_display: Option<crate::DisplayContext>,
 }
 
 impl Default for FormatConfig {
@@ -38,6 +54,7 @@ impl Default for FormatConfig {
         Self {
             alignment: Alignment::default(),
             indent: "  ".to_string(),
+            number_display: None,
         }
     }
 }
@@ -49,7 +66,7 @@ impl FormatConfig {
     pub fn with_column(column: usize) -> Self {
         Self {
             alignment: Alignment::CurrencyColumn(column),
-            indent: "  ".to_string(),
+            ..Self::default()
         }
     }
 
@@ -57,8 +74,8 @@ impl FormatConfig {
     #[must_use]
     pub fn with_indent(indent_width: usize) -> Self {
         Self {
-            alignment: Alignment::default(),
             indent: " ".repeat(indent_width),
+            ..Self::default()
         }
     }
 
@@ -68,6 +85,7 @@ impl FormatConfig {
         Self {
             alignment: Alignment::CurrencyColumn(column),
             indent: " ".repeat(indent_width),
+            ..Self::default()
         }
     }
 }
@@ -96,6 +114,31 @@ pub fn format_directive_lines(directive: &Directive, config: &FormatConfig) -> V
     }
 }
 
+/// Render one number for ledger text.
+///
+/// Through the config's [`crate::DisplayContext`] when present, or the
+/// value's own scale otherwise. The single chokepoint every formatter
+/// amount/cost/price number emission goes through — keep it that way
+/// so the two behaviors cannot drift per call site (#1766).
+///
+/// Context semantics come from [`crate::DisplayContext::format_plain`]:
+/// a TRACKED currency pads to the tracked precision (never rounding an
+/// over-precise value away); an UNTRACKED currency stays byte-faithful
+/// to its own scale; thousands separators are never emitted (canonical
+/// ledger text carries none — `render_commas` stays a report/query
+/// display concern).
+#[must_use]
+pub fn render_number(
+    number: rust_decimal::Decimal,
+    currency: &str,
+    config: &FormatConfig,
+) -> String {
+    match &config.number_display {
+        Some(ctx) => ctx.format_plain(number, currency),
+        None => number.to_string(),
+    }
+}
+
 /// Format a list of directives to a string, aligning all of them together
 /// against shared, file-wide column widths in a single pass.
 ///
@@ -116,6 +159,10 @@ pub fn format_directive_lines(directive: &Directive, config: &FormatConfig) -> V
 /// between directives should drop down to [`format_directive_lines`] +
 /// [`render_lines`] and push a `FormatLine::Plain(String::new())` between
 /// each directive's lines (see `crates/rustledger/src/cmd/extract_cmd` for
+/// an example).
+///
+/// Numbers render through [`render_number`] — the config's optional
+/// display context applies per-currency precision padding (#1766).
 /// an example).
 #[must_use]
 pub fn format_directives<'a, I>(directives: I, config: &FormatConfig) -> String
@@ -245,73 +292,94 @@ mod tests {
     #[test]
     fn test_format_meta_value_string() {
         let val = MetaValue::String("hello world".to_string());
-        assert_eq!(format_meta_value(&val), "\"hello world\"");
+        assert_eq!(
+            format_meta_value(&val, &FormatConfig::default()),
+            "\"hello world\""
+        );
     }
 
     #[test]
     fn test_format_meta_value_string_with_quotes() {
         let val = MetaValue::String("say \"hello\"".to_string());
-        assert_eq!(format_meta_value(&val), "\"say \\\"hello\\\"\"");
+        assert_eq!(
+            format_meta_value(&val, &FormatConfig::default()),
+            "\"say \\\"hello\\\"\""
+        );
     }
 
     #[test]
     fn test_format_meta_value_account() {
         let val = MetaValue::Account("Assets:Bank:Checking".into());
-        assert_eq!(format_meta_value(&val), "Assets:Bank:Checking");
+        assert_eq!(
+            format_meta_value(&val, &FormatConfig::default()),
+            "Assets:Bank:Checking"
+        );
     }
 
     #[test]
     fn test_format_meta_value_currency() {
         let val = MetaValue::Currency("USD".into());
-        assert_eq!(format_meta_value(&val), "USD");
+        assert_eq!(format_meta_value(&val, &FormatConfig::default()), "USD");
     }
 
     #[test]
     fn test_format_meta_value_tag() {
         let val = MetaValue::Tag("trip-2024".into());
-        assert_eq!(format_meta_value(&val), "#trip-2024");
+        assert_eq!(
+            format_meta_value(&val, &FormatConfig::default()),
+            "#trip-2024"
+        );
     }
 
     #[test]
     fn test_format_meta_value_link() {
         let val = MetaValue::Link("invoice-123".into());
-        assert_eq!(format_meta_value(&val), "^invoice-123");
+        assert_eq!(
+            format_meta_value(&val, &FormatConfig::default()),
+            "^invoice-123"
+        );
     }
 
     #[test]
     fn test_format_meta_value_date() {
         let val = MetaValue::Date(date(2024, 6, 15));
-        assert_eq!(format_meta_value(&val), "2024-06-15");
+        assert_eq!(
+            format_meta_value(&val, &FormatConfig::default()),
+            "2024-06-15"
+        );
     }
 
     #[test]
     fn test_format_meta_value_number() {
         let val = MetaValue::Number(dec!(123.456));
-        assert_eq!(format_meta_value(&val), "123.456");
+        assert_eq!(format_meta_value(&val, &FormatConfig::default()), "123.456");
     }
 
     #[test]
     fn test_format_meta_value_amount() {
         let val = MetaValue::Amount(Amount::new(dec!(99.99), "USD"));
-        assert_eq!(format_meta_value(&val), "99.99 USD");
+        assert_eq!(
+            format_meta_value(&val, &FormatConfig::default()),
+            "99.99 USD"
+        );
     }
 
     #[test]
     fn test_format_meta_value_bool_true() {
         let val = MetaValue::Bool(true);
-        assert_eq!(format_meta_value(&val), "TRUE");
+        assert_eq!(format_meta_value(&val, &FormatConfig::default()), "TRUE");
     }
 
     #[test]
     fn test_format_meta_value_bool_false() {
         let val = MetaValue::Bool(false);
-        assert_eq!(format_meta_value(&val), "FALSE");
+        assert_eq!(format_meta_value(&val, &FormatConfig::default()), "FALSE");
     }
 
     #[test]
     fn test_format_meta_value_none() {
         let val = MetaValue::None;
-        assert_eq!(format_meta_value(&val), "");
+        assert_eq!(format_meta_value(&val, &FormatConfig::default()), "");
     }
 
     #[test]
@@ -325,7 +393,10 @@ mod tests {
             label: None,
             merge: false,
         };
-        assert_eq!(format_cost_spec(&spec), "{150.00 USD}");
+        assert_eq!(
+            format_cost_spec(&spec, &FormatConfig::default()),
+            "{150.00 USD}"
+        );
     }
 
     #[test]
@@ -339,7 +410,10 @@ mod tests {
             label: None,
             merge: false,
         };
-        assert_eq!(format_cost_spec(&spec), "{{1500.00 USD}}");
+        assert_eq!(
+            format_cost_spec(&spec, &FormatConfig::default()),
+            "{{1500.00 USD}}"
+        );
     }
 
     #[test]
@@ -353,7 +427,10 @@ mod tests {
             label: None,
             merge: false,
         };
-        assert_eq!(format_cost_spec(&spec), "{150.00 USD, 2024-01-15}");
+        assert_eq!(
+            format_cost_spec(&spec, &FormatConfig::default()),
+            "{150.00 USD, 2024-01-15}"
+        );
     }
 
     #[test]
@@ -367,7 +444,10 @@ mod tests {
             label: Some("lot-a".to_string()),
             merge: false,
         };
-        assert_eq!(format_cost_spec(&spec), "{150.00 USD, \"lot-a\"}");
+        assert_eq!(
+            format_cost_spec(&spec, &FormatConfig::default()),
+            "{150.00 USD, \"lot-a\"}"
+        );
     }
 
     #[test]
@@ -381,7 +461,10 @@ mod tests {
             label: None,
             merge: true,
         };
-        assert_eq!(format_cost_spec(&spec), "{150.00 USD, *}");
+        assert_eq!(
+            format_cost_spec(&spec, &FormatConfig::default()),
+            "{150.00 USD, *}"
+        );
     }
 
     #[test]
@@ -396,7 +479,7 @@ mod tests {
             merge: true,
         };
         assert_eq!(
-            format_cost_spec(&spec),
+            format_cost_spec(&spec, &FormatConfig::default()),
             "{150.00 USD, 2024-01-15, \"lot-a\", *}"
         );
     }
@@ -410,61 +493,88 @@ mod tests {
             label: None,
             merge: false,
         };
-        assert_eq!(format_cost_spec(&spec), "{}");
+        assert_eq!(format_cost_spec(&spec, &FormatConfig::default()), "{}");
     }
 
     #[test]
     fn test_format_price_annotation_unit() {
         let price = PriceAnnotation::unit(Amount::new(dec!(150.00), "USD"));
-        assert_eq!(format_price_annotation(&price), "@ 150.00 USD");
+        assert_eq!(
+            format_price_annotation(&price, &FormatConfig::default()),
+            "@ 150.00 USD"
+        );
     }
 
     #[test]
     fn test_format_price_annotation_total() {
         let price = PriceAnnotation::total(Amount::new(dec!(1500.00), "USD"));
-        assert_eq!(format_price_annotation(&price), "@@ 1500.00 USD");
+        assert_eq!(
+            format_price_annotation(&price, &FormatConfig::default()),
+            "@@ 1500.00 USD"
+        );
     }
 
     #[test]
     fn test_format_price_annotation_unit_incomplete() {
         let price = PriceAnnotation::unit_incomplete(IncompleteAmount::NumberOnly(dec!(150.00)));
-        assert_eq!(format_price_annotation(&price), "@ 150.00");
+        assert_eq!(
+            format_price_annotation(&price, &FormatConfig::default()),
+            "@ 150.00"
+        );
     }
 
     #[test]
     fn test_format_price_annotation_total_incomplete() {
         let price = PriceAnnotation::total_incomplete(IncompleteAmount::CurrencyOnly("USD".into()));
-        assert_eq!(format_price_annotation(&price), "@@ USD");
+        assert_eq!(
+            format_price_annotation(&price, &FormatConfig::default()),
+            "@@ USD"
+        );
     }
 
     #[test]
     fn test_format_price_annotation_unit_empty() {
         let price = PriceAnnotation::unit_empty();
-        assert_eq!(format_price_annotation(&price), "@");
+        assert_eq!(
+            format_price_annotation(&price, &FormatConfig::default()),
+            "@"
+        );
     }
 
     #[test]
     fn test_format_price_annotation_total_empty() {
         let price = PriceAnnotation::total_empty();
-        assert_eq!(format_price_annotation(&price), "@@");
+        assert_eq!(
+            format_price_annotation(&price, &FormatConfig::default()),
+            "@@"
+        );
     }
 
     #[test]
     fn test_format_incomplete_amount_complete() {
         let amount = IncompleteAmount::Complete(Amount::new(dec!(100.50), "EUR"));
-        assert_eq!(format_incomplete_amount(&amount), "100.50 EUR");
+        assert_eq!(
+            format_incomplete_amount(&amount, &FormatConfig::default()),
+            "100.50 EUR"
+        );
     }
 
     #[test]
     fn test_format_incomplete_amount_number_only() {
         let amount = IncompleteAmount::NumberOnly(dec!(42.00));
-        assert_eq!(format_incomplete_amount(&amount), "42.00");
+        assert_eq!(
+            format_incomplete_amount(&amount, &FormatConfig::default()),
+            "42.00"
+        );
     }
 
     #[test]
     fn test_format_incomplete_amount_currency_only() {
         let amount = IncompleteAmount::CurrencyOnly("BTC".into());
-        assert_eq!(format_incomplete_amount(&amount), "BTC");
+        assert_eq!(
+            format_incomplete_amount(&amount, &FormatConfig::default()),
+            "BTC"
+        );
     }
 
     #[test]
@@ -779,6 +889,75 @@ mod tests {
         assert!(formatted.contains("! Expenses:Unknown"));
     }
 
+    /// The optional number-display context (#1766): fixed precision
+    /// pads; thousands separators are NOT emitted in ledger text even
+    /// when the context requests them (canonical form has none); and
+    /// the default config stays byte-identical to the historical
+    /// own-scale rendering.
+    #[test]
+    fn number_display_context_pads_without_separators() {
+        use crate::DisplayContext;
+        let mut ctx = DisplayContext::new();
+        ctx.set_fixed_precision("USD", 2);
+        ctx.set_render_commas(true);
+        let config = FormatConfig {
+            number_display: Some(ctx),
+            ..FormatConfig::default()
+        };
+
+        assert_eq!(
+            render_number(rust_decimal_macros::dec!(1234.5), "USD", &config),
+            "1234.50",
+            "fixed precision pads; separators stay a display concern"
+        );
+        assert_eq!(
+            render_number(rust_decimal_macros::dec!(7), "JPY", &config),
+            "7",
+            "untracked currencies keep natural rendering"
+        );
+        assert_eq!(
+            render_number(rust_decimal_macros::dec!(100.50), "EUR", &config),
+            "100.50",
+            "untracked currencies stay byte-faithful — no trailing-zero \
+             stripping, which would widen a balance assertion's implicit \
+             tolerance (deep review of #1807)"
+        );
+        assert_eq!(
+            render_number(
+                rust_decimal_macros::dec!(1234.5),
+                "USD",
+                &FormatConfig::default()
+            ),
+            "1234.5",
+            "no context = historical own-scale rendering"
+        );
+    }
+
+    /// The context threads through every directive number emission:
+    /// balance, price, and posting units/cost/price annotations.
+    #[test]
+    fn number_display_context_threads_through_directives() {
+        use crate::DisplayContext;
+        let mut ctx = DisplayContext::new();
+        ctx.set_fixed_precision("USD", 2);
+        ctx.set_render_commas(true);
+        let config = FormatConfig {
+            number_display: Some(ctx),
+            ..FormatConfig::default()
+        };
+
+        let bal = Balance::new(
+            crate::naive_date(2024, 1, 15).unwrap(),
+            "Assets:Bank",
+            Amount::new(rust_decimal_macros::dec!(1234.5), "USD"),
+        );
+        let out = format_directives(std::iter::once(&Directive::Balance(bal)), &config);
+        assert_eq!(
+            out, "2024-01-15 balance Assets:Bank  1234.50 USD\n",
+            "balance renders through the context (padded, no separators)"
+        );
+    }
+
     #[test]
     fn test_format_posting_no_units() {
         let posting = Posting {
@@ -1002,25 +1181,37 @@ mod tests {
     #[test]
     fn test_format_amount_negative() {
         let amount = Amount::new(dec!(-100.50), "USD");
-        assert_eq!(format_amount(&amount), "-100.50 USD");
+        assert_eq!(
+            format_amount_with(&amount, &FormatConfig::default()),
+            "-100.50 USD"
+        );
     }
 
     #[test]
     fn test_format_amount_zero() {
         let amount = Amount::new(dec!(0), "EUR");
-        assert_eq!(format_amount(&amount), "0 EUR");
+        assert_eq!(
+            format_amount_with(&amount, &FormatConfig::default()),
+            "0 EUR"
+        );
     }
 
     #[test]
     fn test_format_amount_large_number() {
         let amount = Amount::new(dec!(1234567890.12), "USD");
-        assert_eq!(format_amount(&amount), "1234567890.12 USD");
+        assert_eq!(
+            format_amount_with(&amount, &FormatConfig::default()),
+            "1234567890.12 USD"
+        );
     }
 
     #[test]
     fn test_format_amount_small_decimal() {
         let amount = Amount::new(dec!(0.00001), "BTC");
-        assert_eq!(format_amount(&amount), "0.00001 BTC");
+        assert_eq!(
+            format_amount_with(&amount, &FormatConfig::default()),
+            "0.00001 BTC"
+        );
     }
 
     #[test]
