@@ -169,9 +169,45 @@ pub(super) fn feed_date_or(
     raw: Option<&str>,
     fallback: rustledger_core::NaiveDate,
 ) -> rustledger_core::NaiveDate {
+    feed_date(raw).unwrap_or(fallback)
+}
+
+/// Strict variant of [`feed_date_or`]: the parsed feed date, or `None`.
+///
+/// For HISTORICAL rows a malformed date must SKIP the row — a fallback
+/// label there would either mislabel the value or be discarded by the
+/// dispatch's on-or-before selection (deep review of #1804: three
+/// sources had re-derived this slice-and-parse inline).
+pub(super) fn feed_date(raw: Option<&str>) -> Option<rustledger_core::NaiveDate> {
     raw.and_then(|s| s.get(..10))
         .and_then(|s| s.parse::<rustledger_core::NaiveDate>().ok())
-        .unwrap_or(fallback)
+}
+
+/// Refuse ticker/currency values that could rewrite a provider URL.
+///
+/// Every builtin source interpolates the ticker and quote currency into
+/// its request URLs unescaped; a crafted value like
+/// `000001&endDate=2019-01-01` (for example from `price:` metadata in a
+/// shared ledger) would override the window parameters and silently
+/// fetch a different date's price (deep review of #1804). Real ticker
+/// shapes need `.` `-` `_` `:` `/` `=` (`BRK.B`, `BTC-USD`, `EUR_USD`,
+/// `CRYPTO:BTC`, `WIKI/AAPL`, `EURUSD=X`), so this rejects only the URL
+/// metacharacters and whitespace/control bytes. Enforced ONCE in the
+/// canonical dispatch — `ExternalCommandSource` has its own stricter
+/// `validate_ticker` for shell safety.
+///
+/// # Errors
+/// Errors when `value` is empty or contains a rejected character.
+fn reject_url_metacharacters(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("empty {kind} cannot be fetched");
+    }
+    if value.chars().any(|c| {
+        matches!(c, '&' | '?' | '#' | '%' | '@' | '+') || c.is_whitespace() || c.is_control()
+    }) {
+        anyhow::bail!("{kind} '{value}' contains characters not allowed in a provider request");
+    }
+    Ok(())
 }
 
 /// Trait for price data sources.
@@ -292,6 +328,12 @@ pub trait PriceSource: Send + Sync {
     /// requests the source cannot serve; "no quote on or before" when
     /// the fetched window is empty.
     fn fetch_price(&self, request: &PriceRequest) -> Result<PriceResponse> {
+        // 0. URL-safety: the ticker and currency flow into provider
+        // URLs unescaped in every source — refuse metacharacters here,
+        // once, before any routing (deep review of #1804).
+        reject_url_metacharacters("ticker", &request.ticker)?;
+        reject_url_metacharacters("currency", &request.currency)?;
+
         // 1. Identity: X priced in X is 1.0 on any past-or-today date,
         // source-independent (hoisted out of per-source branches by the
         // #1801 reviews; future labels refuse). The currency is
@@ -875,6 +917,40 @@ mod feed_date_tests {
         );
     }
 
+    /// URL metacharacters in tickers/currencies refuse at the dispatch
+    /// before any routing — a crafted value must not rewrite a provider
+    /// request's parameters (deep review of #1804). Real ticker shapes
+    /// (dots, dashes, colons, slashes, equals) pass.
+    #[test]
+    fn url_metacharacters_are_refused() {
+        for bad in [
+            "000001&endDate=2019-01-01",
+            "USD?x=1",
+            "AAPL#frag",
+            "BTC%2DUSD",
+            "EUR USD",
+            "",
+        ] {
+            assert!(
+                super::reject_url_metacharacters("ticker", bad).is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+        for good in [
+            "BRK.B",
+            "BTC-USD",
+            "EUR_USD",
+            "CRYPTO:BTC",
+            "WIKI/AAPL",
+            "EURUSD=X",
+        ] {
+            assert!(
+                super::reject_url_metacharacters("ticker", good).is_ok(),
+                "must allow {good:?}"
+            );
+        }
+    }
+
     /// Absent, short, or malformed fields fall back to today instead of
     /// erroring — the date label degrades, the price still flows.
     #[test]
@@ -904,16 +980,7 @@ mod capability_wiring_tests {
     fn latest_only_builtins_refuse_dated_fetches() {
         let registry = PriceSourceRegistry::new(&PriceConfig::default());
         let past = rustledger_core::naive_date(2000, 1, 3).expect("valid date");
-        for name in [
-            "alphavantage",
-            "coincap",
-            "coinmarketcap",
-            "eastmoneyfund",
-            "ecb",
-            "oanda",
-            "quandl",
-            "tsp",
-        ] {
+        for name in ["coincap", "coinmarketcap", "oanda"] {
             let source = registry
                 .get(name)
                 .unwrap_or_else(|| panic!("builtin source '{name}' must exist"));
@@ -960,5 +1027,17 @@ mod capability_wiring_tests {
             coverage("ratesapi"),
             HistoricalCoverage::Since(rustledger_core::naive_date(1999, 1, 4).unwrap())
         );
+        // The remaining table rows of #1802, ported in the source-ports
+        // PR: ecb shares ratesapi's EU-reference epoch; the rest carry
+        // provider-defined history (per-ticker gaps surface as clean
+        // no-quote/refusal errors at fetch).
+        assert_eq!(
+            coverage("ecb"),
+            HistoricalCoverage::Since(rustledger_core::naive_date(1999, 1, 4).unwrap())
+        );
+        assert_eq!(coverage("alphavantage"), HistoricalCoverage::Full);
+        assert_eq!(coverage("quandl"), HistoricalCoverage::Full);
+        assert_eq!(coverage("tsp"), HistoricalCoverage::Full);
+        assert_eq!(coverage("eastmoneyfund"), HistoricalCoverage::Full);
     }
 }
