@@ -3,7 +3,7 @@
 //! This module provides a price source that executes an external command
 //! to fetch prices. This allows users to integrate custom price fetchers.
 
-use super::sources::PriceSource;
+use super::sources::{PricePair, PriceSource};
 use super::{PriceRequest, PriceResponse};
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
@@ -200,19 +200,50 @@ impl PriceSource for ExternalCommandSource {
         "External command price source"
     }
 
+    fn fetch_latest(&self, pair: &PricePair) -> Result<PriceResponse> {
+        // Delegates to the INHERENT run_command, not the trait's
+        // fetch_price: routing through the trait would be mutual
+        // recursion held together only by this type's fetch_price
+        // override existing — deleting that override in a future
+        // refactor would turn every undated fetch into unbounded
+        // recursion with no compiler warning (round-5 deep review of
+        // #1803).
+        self.run_command(&PriceRequest {
+            ticker: pair.ticker.clone(),
+            currency: pair.currency.clone(),
+            date: None,
+        })
+    }
+
+    fn historical_coverage(&self) -> super::sources::HistoricalCoverage {
+        // The date is forwarded to the user's command via RLEDGER_DATE;
+        // whatever history the command can serve, this source can.
+        super::sources::HistoricalCoverage::Full
+    }
+
     fn fetch_price(&self, request: &PriceRequest) -> Result<PriceResponse> {
-        // Deliberately NOT guarded by `reject_historical_date`: the
-        // requested date is forwarded to the external command via
-        // RLEDGER_DATE below, so historical semantics are the external
-        // fetcher's contract, not ours (#1801 review). That contract is
-        // a TRUST contract: output formats that carry no date of their
-        // own (plain number, JSON without a date field) are labeled with
-        // the requested date on the assumption the command honored
-        // RLEDGER_DATE — rledger cannot verify a user-authored command,
-        // so a script that ignores the date and prints its latest quote
-        // WILL be recorded under the requested date. Documented in
-        // docs/commands/price.md; scripts that can't honor RLEDGER_DATE
-        // should emit the dated beancount form instead (round-4 review).
+        self.run_command(request)
+    }
+}
+
+impl ExternalCommandSource {
+    /// Invoke the external command and parse its output — the shared
+    /// core behind both trait methods (see `fetch_latest`'s comment on
+    /// why they must not call each other through the trait).
+    fn run_command(&self, request: &PriceRequest) -> Result<PriceResponse> {
+        // The ONE sanctioned override of the trait's canonical dispatch
+        // (see `PriceSource::fetch_price`): the requested date is
+        // forwarded to the external command via RLEDGER_DATE below, so
+        // historical semantics are the external fetcher's contract, not
+        // ours (#1801 review). That contract is a TRUST contract: output
+        // formats that carry no date of their own (plain number, JSON
+        // without a date field) are labeled with the requested date on
+        // the assumption the command honored RLEDGER_DATE — rledger
+        // cannot verify a user-authored command, so a script that
+        // ignores the date and prints its latest quote WILL be recorded
+        // under the requested date. Documented in docs/commands/price.md;
+        // scripts that can't honor RLEDGER_DATE should emit the dated
+        // beancount form instead (round-4 review).
         if self.command.is_empty() {
             anyhow::bail!("External command is empty");
         }
