@@ -40,12 +40,14 @@ use exports::rustledger::ledger::builder::{Directive, Guest as BuilderGuest, Inp
 use exports::rustledger::ledger::format::Guest as FormatGuest;
 use exports::rustledger::ledger::importer::{ExtractResult, Guest as ImporterGuest};
 use exports::rustledger::ledger::ledger::{
-    BatchResult, Guest as LedgerGuest, GuestSession, LoadResult, QueryResult, Session,
-    ValidateResult,
+    BatchResult, Guest as LedgerGuest, GuestSession, LedgerOptions, LoadResult, QueryResult,
+    Session, ValidateResult,
 };
 use exports::rustledger::ledger::util::{Guest as UtilGuest, TypesInfo};
 
-/// The Component-Model api-version this build implements. 3.6 adds
+/// The Component-Model api-version this build implements. 3.7 adds
+/// `session.from-entries-with-options` (the session carries the
+/// ledger's options over the boundary, #1766); 3.6 added
 /// `importer.dedup` and `format.format-loaded` (the extract → review →
 /// save loop); 3.5 added the `importer` interface (identify / infer /
 /// extract — the `rledger extract` engine over the boundary); 3.4 added
@@ -54,7 +56,7 @@ use exports::rustledger::ledger::util::{Guest as UtilGuest, TypesInfo};
 /// encrypted (`.gpg`/`.asc`) ledgers can be decrypted by the host (#1667);
 /// 3.1 added the `diff` field on `balance-dir` (#1663); 3.0 was the breaking
 /// `expand-pads` parameter on `load`/`load-file` (#1628).
-const API_VERSION: &str = "3.6";
+const API_VERSION: &str = "3.7";
 
 struct Component;
 
@@ -112,6 +114,12 @@ impl GuestSession for LedgerSession {
     fn from_entries(entries: Vec<Directive>) -> Session {
         Session::new(Self {
             state: convert::SessionState::from_entries(&entries),
+        })
+    }
+
+    fn from_entries_with_options(entries: Vec<Directive>, options: LedgerOptions) -> Session {
+        Session::new(Self {
+            state: convert::SessionState::from_entries_with_options(&entries, options),
         })
     }
 

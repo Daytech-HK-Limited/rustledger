@@ -1478,7 +1478,9 @@ pub fn query_entries(entries: &[wit::Directive], query_str: &str) -> out::QueryR
     // The `query-entries` WIT contract carries no ledger options, so the
     // classifier defaults to the standard five roots. Renamed-root ledgers
     // queried via host-provided entries won't POSSIGN-flip custom names —
-    // extending the contract with options is a WIT-version decision (L5 note).
+    // `session.from-entries-with-options` (3.7.0, #1766) is the
+    // options-carrying path; this free function is doc-soft-deprecated
+    // in its favor.
     run_query(
         &directives,
         query_str,
@@ -1492,6 +1494,27 @@ pub fn query_entries(entries: &[wit::Directive], query_str: &str) -> out::QueryR
 // `query`/`filter`/`clamp` methods don't care which produced it. The win over
 // the free functions: these run against the held *core* directives, so they
 // never re-parse source nor round-trip a directive list through the host.
+
+/// Replace empty `name-*` roots in host-supplied options with their
+/// defaults: an empty root can never classify an account, so a
+/// zero-initialized record from a guest language would silently break
+/// every `POSSIGN`/`ACCOUNT_SORTKEY` result with no diagnostic (deep
+/// review of #1805). Non-empty values pass through verbatim — including
+/// duplicates, which are the host's to avoid.
+fn sanitize_options(mut provided: wit::LedgerOptions) -> wit::LedgerOptions {
+    let defaults = options(ffi::LedgerOptions::default());
+    let fix = |field: &mut String, default: String| {
+        if field.is_empty() {
+            *field = default;
+        }
+    };
+    fix(&mut provided.name_assets, defaults.name_assets);
+    fix(&mut provided.name_liabilities, defaults.name_liabilities);
+    fix(&mut provided.name_equity, defaults.name_equity);
+    fix(&mut provided.name_income, defaults.name_income);
+    fix(&mut provided.name_expenses, defaults.name_expenses);
+    provided
+}
 
 /// Held state behind a `session` resource: the booked core directives + their
 /// per-directive provenance, plus the load metadata, normalized across the
@@ -1537,6 +1560,32 @@ impl SessionState {
     /// Conversion failures (e.g. un-lexable accounts, see the note on
     /// `clamp`) drop the directive, mirroring `query-entries`.
     pub fn from_entries(entries: &[wit::Directive]) -> Self {
+        // Held entries carry no ledger options (they were stripped at
+        // the original load); defaults here match what a stand-alone
+        // directive set implies. Embedders holding the original load's
+        // options should use `from_entries_with_options` (#1766).
+        Self::from_entries_with_options(entries, options(ffi::LedgerOptions::default()))
+    }
+
+    /// `from_entries` with the ledger's options attached (WIT 3.7.0,
+    /// #1766). What the held options DO today: `query` builds its
+    /// account classifier from the `name-*` roots (BQL
+    /// `POSSIGN`/`ACCOUNT_SORTKEY` on renamed-root ledgers), and
+    /// `info()` echoes the full record. Booked-time options
+    /// (booking-method, tolerances) cannot re-apply — the entries are
+    /// already booked — and clamp/rendering do not consume options yet
+    /// (#1766 tracks both).
+    ///
+    /// Empty `name-*` fields are replaced with their defaults (an
+    /// empty root can never classify — a zero-initialized record from
+    /// a guest language would silently break every classification);
+    /// duplicated roots are the host's to avoid: classification
+    /// matches roots exactly, first match wins.
+    pub fn from_entries_with_options(
+        entries: &[wit::Directive],
+        options: wit::LedgerOptions,
+    ) -> Self {
+        let options = sanitize_options(options);
         // The one-time conversion is this API's whole reason to exist —
         // reserve up front so a large ledger doesn't reallocate through
         // the collect (review catch; drops are rare, over-reserving by
@@ -1553,11 +1602,7 @@ impl SessionState {
             lines: vec![0; n],
             files: vec!["<entries>".to_string(); n],
             errors: vec![],
-            // Held entries carry no ledger options (they were stripped at
-            // the original load); defaults here match what a stand-alone
-            // directive set implies. Embedders holding options should keep
-            // consulting their load-time `info()`.
-            options: options(ffi::LedgerOptions::default()),
+            options,
             plugins: vec![],
             includes: vec![],
             padded: std::cell::OnceCell::new(),
@@ -2215,6 +2260,108 @@ fn extract_warning(message: String) -> wit::Error {
         entry_index: None,
         severity: "warning".to_string(),
         phase: "extract".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod session_options_tests {
+    //! The `from-entries-with-options` carrier (WIT 3.7.0, #1766): a
+    //! session rebuilt from another session's `info()` must classify
+    //! accounts with the LEDGER's roots, where the options-less
+    //! `from_entries` falls back to the defaults. POSSIGN is the exact
+    //! observable the L5 note recorded as broken.
+
+    use super::SessionState;
+
+    const RENAMED: &str = "\
+option \"name_income\" \"Einnahmen\"
+2024-01-01 open Einnahmen:Salary
+2024-01-01 open Assets:Bank
+
+2024-01-02 * \"pay\"
+  Assets:Bank  100.00 USD
+  Einnahmen:Salary
+";
+
+    /// The first cell of the first row as the typed numeric value —
+    /// exact-variant matching, not a debug-substring proxy (Copilot
+    /// review: `contains("-100")` also matches "-1000").
+    fn first_number(result: &super::out::QueryResult) -> String {
+        match result
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .expect("query returns at least one row")
+        {
+            super::wit::QueryValue::Number(n) => n.clone(),
+            other => panic!("POSSIGN must return query-value::number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_options_honors_renamed_roots_where_from_entries_defaults() {
+        let loaded = SessionState::from_source(RENAMED);
+        let info = loaded.info();
+        assert!(
+            info.errors.is_empty(),
+            "fixture must load: {:?}",
+            info.errors
+        );
+
+        // POSSIGN negates income-rooted accounts; "Einnahmen" is income
+        // only when the ledger's renamed roots are carried.
+        let query = "SELECT possign(100, 'Einnahmen:Salary')";
+
+        let with_options =
+            SessionState::from_entries_with_options(&info.entries, info.options.clone());
+        assert_eq!(
+            first_number(&with_options.query(query)),
+            "-100",
+            "renamed income root must POSSIGN-negate"
+        );
+
+        let without_options = SessionState::from_entries(&info.entries);
+        assert_eq!(
+            first_number(&without_options.query(query)),
+            "100",
+            "options-less entries default the classifier (documented, #1766)"
+        );
+    }
+
+    /// Empty `name-*` roots are replaced with defaults — a
+    /// zero-initialized options record must not silently break every
+    /// classification (deep review of #1805).
+    #[test]
+    fn empty_roots_fall_back_to_defaults() {
+        let loaded = SessionState::from_source(RENAMED);
+        let info = loaded.info();
+        let mut options = info.options.clone();
+        options.name_assets = String::new();
+        let session = SessionState::from_entries_with_options(&info.entries, options);
+        let echoed = session.info().options;
+        assert_eq!(echoed.name_assets, "Assets", "empty root falls back");
+        assert_eq!(
+            echoed.name_income, "Einnahmen",
+            "provided roots pass through"
+        );
+    }
+
+    /// `info()` echoes the provided options — the session is the
+    /// canonical carrier, so a host can round-trip them.
+    #[test]
+    fn info_echoes_provided_options() {
+        let loaded = SessionState::from_source(RENAMED);
+        let info = loaded.info();
+        let session = SessionState::from_entries_with_options(&info.entries, info.options.clone());
+        assert_eq!(session.info().options.name_income, "Einnahmen");
+        // And the options-less constructor documents its default.
+        assert_eq!(
+            SessionState::from_entries(&info.entries)
+                .info()
+                .options
+                .name_income,
+            "Income"
+        );
     }
 }
 
