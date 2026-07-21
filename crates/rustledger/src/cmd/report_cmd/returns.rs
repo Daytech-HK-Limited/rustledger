@@ -1,21 +1,60 @@
-//! Returns report — the money-weighted (XIRR) investment return for an account
-//! scope.
+//! Returns report — money-weighted (XIRR) and time-weighted (TWR) investment
+//! return for an account scope, optionally broken down per group.
 //!
 //! This is the CLI consumer of the `rustledger-returns` engine. It defines the
 //! portfolio boundary from `--investments` / `--income` account prefixes, builds
-//! a price index from the ledger, and reports the annualized money-weighted
-//! return along with the supporting figures (capital invested, distributions
-//! received, and current market value).
+//! a price index from the ledger, and reports the annualized returns plus the
+//! supporting figures (capital invested, distributions received, current market
+//! value).
 //!
-//! Time-weighted return and per-commodity grouping are not yet implemented; this
-//! reports a single money-weighted return for the whole scope (see #1814).
+//! # Grouping (#1820)
+//!
+//! By default the report is the single whole-scope summary. With **`--by-group`**
+//! it additionally reports one row per `returns-group:` group: tag `open`
+//! directives with `returns-group: "Name"`, and each group's members are
+//! classified by the whole scope — accounts under `--investments` form the
+//! group's investment scope, accounts under `--income` its income scope — so a
+//! group that tags its dividend account reports a **dividend-inclusive** return.
+//! This is beangrow's group model, declared in the ledger rather than an external
+//! config file.
+//!
+//! Each group is an **independent sub-portfolio**: its return is computed over
+//! just that group's accounts, exactly as if you had run the report with
+//! `--investments`/`--income` narrowed to them. This matches how beangrow and
+//! hledger `roi` present grouped returns — and, deliberately, the groups are
+//! **not** claimed to sum to the TOTAL. They can't be in general: whenever two
+//! groups share an in-scope account (most often a pooled settlement-cash account
+//! under `--investments`), the boundary flow into that shared account cannot be
+//! attributed to one group, so a partition into reconciling slices is not
+//! well-defined. The TOTAL row is the whole-portfolio figure (every in-scope
+//! account), reported alongside for reference, not as the sum of the rows above.
+//!
+//! Grouping is opt-in, so the default output shape is unchanged. Only tagged
+//! accounts appear; an untagged in-scope holding is simply omitted from the
+//! breakdown (it is still in the TOTAL). Warnings (to stderr) flag the cases a
+//! reader would otherwise misread: a tag on an out-of-scope account, a non-string
+//! tag value, two groups whose accounts overlap by prefix (the shared holding is
+//! counted in both), and a group that is not self-contained (it shares an
+//! in-scope account with the rest of the portfolio, so its return counts an
+//! internal transfer as a flow).
+//!
+//! Auto per-account and true per-commodity attribution are deliberately *not*
+//! offered: a dividend booked to a shared cash/income account cannot be
+//! attributed to one holding automatically — which is why every reference tool
+//! (beangrow, fava-portfolio-summary) uses declared groups that bundle their
+//! income accounts.
 
 use super::{OutputFormat, csv_escape, json_escape};
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
-use rustledger_core::{Amount, Directive, DisplayContext, NaiveDate};
+use rustledger_core::{
+    Amount, Directive, DisplayContext, MetaValue, NaiveDate, is_subaccount_or_equal,
+};
 use rustledger_query::PriceDatabase;
-use rustledger_returns::{PriceOracle, Scope, extract_flows, terminal_value, twr, xirr};
+use rustledger_returns::{
+    AccountRole, PriceOracle, Scope, extract_flows, terminal_value, twr, xirr,
+};
+use std::collections::BTreeMap;
 use std::io::Write;
 
 /// Adapts the query engine's [`PriceDatabase`] to the returns engine's
@@ -34,11 +73,272 @@ impl PriceOracle for PriceDbOracle<'_> {
     }
 }
 
+/// The computed return figures for one scope (a group, or the whole portfolio).
+struct GroupResult {
+    label: String,
+    flow_count: usize,
+    invested: Decimal,
+    distributions: Decimal,
+    current_value: Decimal,
+    /// Money-weighted return (annualized XIRR); `None` when undefined.
+    mwr: Option<f64>,
+    /// Time-weighted return (annualized); `None` when undefined or unpriceable.
+    twr: Option<f64>,
+}
+
+/// Compute the return summary for one scope.
+///
+/// Extracts the boundary flows and terminal value separately (so the summary can
+/// report capital-in / distributions / current-value), then runs xirr over the
+/// combined, date-sorted series and twr over the same directives. The manual
+/// flows+terminal combine mirrors the engine's canonical `extract_cash_flows`
+/// and is pinned by the `series_matches_extract_cash_flows` test.
+fn compute_group(
+    directives: &[Directive],
+    scope: &Scope,
+    reporting_currency: &str,
+    prices: &impl PriceOracle,
+    end_date: NaiveDate,
+    label: String,
+) -> Result<GroupResult> {
+    let flows = extract_flows(directives, scope, reporting_currency, prices, end_date)
+        .context("extracting investment cash flows")?;
+    let terminal = terminal_value(directives, scope, reporting_currency, prices, end_date)
+        .context("valuing the held position at the report date")?;
+
+    let invested: Decimal = flows
+        .iter()
+        .filter(|f| f.amount.is_sign_negative())
+        .map(|f| -f.amount)
+        .sum();
+    let distributions: Decimal = flows
+        .iter()
+        .filter(|f| f.amount.is_sign_positive())
+        .map(|f| f.amount)
+        .sum();
+    let current_value: Decimal = terminal.map_or(Decimal::ZERO, |t| t.amount);
+
+    let mut series = flows;
+    if let Some(t) = terminal {
+        series.push(t);
+    }
+    series.sort_by_key(|f| f.date);
+    let flow_count = series.len();
+    let mwr = xirr(&series);
+    // A scope that never held investment capital (an income-only group, or a
+    // holding opened but never bought) has no holding period to weight: TWR is
+    // undefined, not a flat 0%. `twr`'s unit-chaining would otherwise return
+    // `Some(0.0)` over the empty position. (`xirr` already yields `None` here.)
+    let twr_rate = if invested.is_zero() && current_value.is_zero() {
+        None
+    } else {
+        // TWR needs a price at every flow date; degrade to n/a rather than error.
+        twr(directives, scope, reporting_currency, prices, end_date).unwrap_or(None)
+    };
+
+    Ok(GroupResult {
+        label,
+        flow_count,
+        invested,
+        distributions,
+        current_value,
+        mwr,
+        twr: twr_rate,
+    })
+}
+
+/// Build the `--by-group` breakdown from `returns-group:` metadata on `open`
+/// directives, one [`Scope`] per group, sorted by group name.
+///
+/// Each tagged account is classified by the **whole scope** — accounts under
+/// `--investments` form their group's investment scope, accounts under
+/// `--income` its income scope — so a group that tags its dividend account is
+/// dividend-inclusive (the beangrow model, in-ledger). Every group is an
+/// independent sub-portfolio; only tagged accounts appear (there is no residual),
+/// and the rows are deliberately not a partition of the total (see the module
+/// docs). Warns — but still returns the group — for the cases a reader would
+/// otherwise misread:
+///
+/// - a `returns-group:` tag on an account that is neither investment nor income
+///   (an Equity/Liability account, or one outside `--investments`/`--income`) —
+///   out of scope, dropped so it is never valued as a phantom holding;
+/// - a non-string `returns-group:` value;
+/// - two groups whose accounts overlap by prefix — `Scope` matches by prefix, so
+///   a tagged ancestor (or a duplicate `open`) values another group's holding
+///   twice;
+/// - a group that is not self-contained: it shares an in-scope account with the
+///   rest of the portfolio, so its flows count an internal transfer as a
+///   contribution/withdrawal.
+///
+/// Bounded by `end_date`, exactly as extraction is: an `open` (or a transaction,
+/// for the self-containment check) dated after the report horizon is ignored, so
+/// a historical report shows no group for an account that does not exist yet.
+///
+/// An empty result means no in-scope account carried a usable tag; the caller
+/// still emits the grouped output shape (an empty group list plus the
+/// whole-portfolio total), just with no group rows.
+fn build_groups(
+    directives: &[Directive],
+    whole_scope: &Scope,
+    end_date: NaiveDate,
+    warn: &mut dyn FnMut(String),
+) -> Vec<(String, Scope)> {
+    // group name -> (investment accounts, income accounts)
+    let mut groups: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    // (account, group) for every tagged in-scope account, for the overlap check.
+    let mut tagged: Vec<(String, String)> = Vec::new();
+
+    for directive in directives {
+        let Directive::Open(open) = directive else {
+            continue;
+        };
+        // Bound grouping by the report horizon, exactly as flow extraction and
+        // valuation are: an account opened after `--end` does not exist yet in
+        // the reported period, so it must not form a (spurious, all-zero) group.
+        if open.date > end_date {
+            continue;
+        }
+        let account = open.account.to_string();
+        let name = match open.meta.get("returns-group") {
+            Some(MetaValue::String(name)) => name.clone(),
+            Some(_) => {
+                warn(format!(
+                    "returns-group on {account} ignored: value must be a quoted string"
+                ));
+                continue;
+            }
+            None => continue,
+        };
+        let role = whole_scope.classify(&account);
+        if role == AccountRole::External {
+            warn(format!(
+                "returns-group on {account} ignored: not under --investments or --income"
+            ));
+            continue;
+        }
+        let bucket = groups.entry(name.clone()).or_default();
+        if role == AccountRole::Income {
+            bucket.1.push(account.clone());
+        } else {
+            bucket.0.push(account.clone());
+        }
+        tagged.push((account, name));
+    }
+
+    // Cross-group prefix overlap: `Scope` classifies by prefix, so a tagged
+    // account that is an ancestor of (or identical to) another group's tagged
+    // account silently values the same holding in both groups.
+    for (i, (a, group_a)) in tagged.iter().enumerate() {
+        for (b, group_b) in &tagged[i + 1..] {
+            if group_a != group_b && (is_subaccount_or_equal(a, b) || is_subaccount_or_equal(b, a))
+            {
+                let (group_a, group_b) = (sanitize_display(group_a), sanitize_display(group_b));
+                warn(format!(
+                    "accounts {a} (group {group_a}) and {b} (group {group_b}) overlap by prefix; \
+                     the shared holding is counted in both groups"
+                ));
+            }
+        }
+    }
+
+    let rows: Vec<(String, Scope)> = groups
+        .into_iter()
+        .map(|(name, (investment, income))| (name, Scope::new(investment, income)))
+        .collect();
+
+    // Self-containment: a group that shares an in-scope account with the rest of
+    // the portfolio (typically a pooled cash account) counts intra-portfolio
+    // transfers as flows, so its return is a standalone view that will not agree
+    // with the total. We can't attribute the pooled flow, so we name it.
+    for (name, scope) in &rows {
+        // `TOTAL` is the label of the whole-portfolio row; a group of the same
+        // name is indistinguishable from it in the text and CSV output (JSON
+        // keeps them structurally separate).
+        if name == "TOTAL" {
+            warn(
+                "group named \"TOTAL\" collides with the whole-portfolio total row in text/CSV output"
+                    .to_string(),
+            );
+        }
+        if let Some(shared) = first_shared_inscope_account(directives, scope, whole_scope, end_date)
+        {
+            let name = sanitize_display(name);
+            warn(format!(
+                "group {name} is not self-contained: it shares in-scope account {shared} with the \
+                 rest of the portfolio, so its return counts internal transfers as flows"
+            ));
+        }
+    }
+
+    rows
+}
+
+/// Replace control characters and the Unicode line/paragraph separators
+/// (U+2028/U+2029) with a space. A `returns-group:` label is arbitrary
+/// user-controlled text; on the human-facing surfaces (the text table, CSV, and
+/// stderr warnings) such bytes could inject terminal escapes or extra lines, so
+/// they are neutralized. The JSON path does not use this — it keeps the label
+/// intact and valid via `escape_json` (C0 control bytes become `\uXXXX`;
+/// U+2028/U+2029 stay as-is, which is already valid inside a JSON string).
+fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The first account, if any, that makes `group_scope` not self-contained: an
+/// account that some transaction touching the group also touches, which is
+/// external to the group but still in the whole portfolio scope. Such an account
+/// (a shared cash/settlement account under `--investments`, say) turns an
+/// intra-portfolio transfer into a boundary flow for the group.
+fn first_shared_inscope_account(
+    directives: &[Directive],
+    group_scope: &Scope,
+    whole_scope: &Scope,
+    end_date: NaiveDate,
+) -> Option<String> {
+    for directive in directives {
+        let Directive::Transaction(txn) = directive else {
+            continue;
+        };
+        // Only activity within the report horizon can affect the reported
+        // figures, so a post-`--end` transfer must not raise a false warning.
+        if txn.date > end_date {
+            continue;
+        }
+        let touches_group = txn
+            .postings
+            .iter()
+            .any(|p| group_scope.classify(p.account.as_str()) != AccountRole::External);
+        if !touches_group {
+            continue;
+        }
+        for posting in &txn.postings {
+            let account = posting.account.as_str();
+            if group_scope.classify(account) == AccountRole::External
+                && whole_scope.classify(account) != AccountRole::External
+            {
+                return Some(account.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Generate the returns report.
 ///
 /// `directives` must be the booked, pad-expanded stream (the returns engine's
 /// input contract); the dispatcher passes `balance_input` for exactly this
-/// reason.
+/// reason. With `by_group`, the report adds one independent-sub-portfolio row per
+/// `returns-group:` group (constrained to `--investments`/`--income`) alongside
+/// the whole-portfolio TOTAL; otherwise it is the single whole-scope summary.
+/// Grouping is opt-in, so the default output shape never changes.
 ///
 /// # Errors
 ///
@@ -54,6 +354,7 @@ pub(super) fn report_returns<W: Write>(
     income: &[String],
     currency_arg: Option<&str>,
     end_arg: Option<&str>,
+    by_group: bool,
     ctx: &DisplayContext,
     format: &OutputFormat,
     writer: &mut W,
@@ -76,68 +377,91 @@ pub(super) fn report_returns<W: Write>(
         None => jiff::Zoned::now().date(),
     };
 
-    let scope = Scope::new(investments.to_vec(), income.to_vec());
+    let whole_scope = Scope::new(investments.to_vec(), income.to_vec());
     // Price index built from the same stream, so implicit transaction prices and
     // explicit `price` directives both feed the valuation.
     let price_db = PriceDatabase::from_directives(directives);
     let oracle = PriceDbOracle(&price_db);
 
-    // Extract boundary flows and the terminal value separately, so the summary
-    // can report capital-in / distributions / current-value independently. xirr
-    // then runs over the combined, date-sorted series.
-    let flows = extract_flows(directives, &scope, &reporting_currency, &oracle, end_date)
-        .context("extracting investment cash flows")?;
-    let terminal = terminal_value(directives, &scope, &reporting_currency, &oracle, end_date)
-        .context("valuing the held position at the report date")?;
-
-    // Supporting figures, all in the reporting currency:
-    //   invested      — capital the investor put in (magnitude of outflows)
-    //   distributions — cash received during the period (dividends, sale proceeds)
-    //   current_value — market value of the position still held (terminal)
-    let invested: Decimal = flows
-        .iter()
-        .filter(|f| f.amount.is_sign_negative())
-        .map(|f| -f.amount)
-        .sum();
-    let distributions: Decimal = flows
-        .iter()
-        .filter(|f| f.amount.is_sign_positive())
-        .map(|f| f.amount)
-        .sum();
-    let current_value: Decimal = terminal.map_or(Decimal::ZERO, |t| t.amount);
-
-    // Combine into the series xirr consumes. This mirrors the engine's
-    // canonical `extract_cash_flows` (flows + terminal, date-sorted); we build it
-    // from the parts here only because the summary above needs `flows` and
-    // `terminal` separately. The `series_matches_extract_cash_flows` test pins
-    // this against the canonical so it can't drift.
-    let mut series = flows;
-    if let Some(t) = terminal {
-        series.push(t);
-    }
-    series.sort_by_key(|f| f.date);
-    let flow_count = series.len();
-    // xirr is `None` when the series has no sign change or is otherwise
-    // degenerate — a genuinely undefined return, reported as "n/a".
-    let rate = xirr(&series);
-    // Time-weighted return: the investments' performance independent of
-    // contribution timing (MWR is the headline). TWR values the portfolio at
-    // EVERY cash-flow date, so it needs more prices than MWR (which only needs
-    // them at transaction dates and the end date). If an intermediate valuation
-    // can't be priced, degrade TWR to n/a rather than failing the whole report —
-    // the money-weighted return above is already computed and is the headline.
-    let twr_rate = twr(directives, &scope, &reporting_currency, &oracle, end_date).unwrap_or(None);
+    let total = compute_group(
+        directives,
+        &whole_scope,
+        &reporting_currency,
+        &oracle,
+        end_date,
+        "TOTAL".to_string(),
+    )?;
 
     let currency = reporting_currency.as_str();
-    let money = |n: Decimal| ctx.format_amount_number(n, currency);
-    let rate_pct = |r: f64| {
-        let pct = r * 100.0;
-        // A 0% return (e.g. capital returned unchanged) converges to a tiny
-        // signed epsilon that would render as "-0.00"; show a clean "0.00".
-        let pct = if pct.abs() < 0.005 { 0.0 } else { pct };
-        format!("{pct:.2}")
-    };
+    if !by_group {
+        return render_single(&total, currency, end_date, ctx, format, writer);
+    }
 
+    // Grouping is opt-in; warnings (bad tags, overlaps, non-self-contained
+    // groups) go to stderr so they never pollute the report on stdout.
+    let group_scopes = build_groups(directives, &whole_scope, end_date, &mut |w| {
+        eprintln!("warning: {w}");
+    });
+    if group_scopes.is_empty() {
+        // Still emit the grouped shape (an empty `groups` list plus the TOTAL):
+        // `--by-group` must produce one stable schema regardless of ledger
+        // content, so a JSON/CSV consumer never has to branch on it.
+        eprintln!(
+            "warning: --by-group but no in-scope `returns-group:` metadata found; reporting only the whole-portfolio total"
+        );
+        return render_grouped(&[], &total, currency, end_date, ctx, format, writer);
+    }
+
+    let groups: Vec<GroupResult> = group_scopes
+        .iter()
+        .map(|(label, scope)| {
+            compute_group(
+                directives,
+                scope,
+                &reporting_currency,
+                &oracle,
+                end_date,
+                label.clone(),
+            )
+        })
+        .collect::<Result<_>>()?;
+
+    render_grouped(&groups, &total, currency, end_date, ctx, format, writer)
+}
+
+/// Format a rate as a 2-decimal percentage string, or `"n/a"` when undefined.
+/// A rate rounding to zero renders a clean `"0.00"` (not `"-0.00"`).
+fn fmt_rate(rate: Option<f64>) -> String {
+    rate.map_or_else(
+        || "n/a".to_string(),
+        |r| {
+            let pct = r * 100.0;
+            let pct = if pct.abs() < 0.005 { 0.0 } else { pct };
+            format!("{pct:.2}")
+        },
+    )
+}
+
+/// A rate for the grouped **text** table: the numeric rate carries its own `%`,
+/// but an undefined rate is `n/a` (not `n/a%`). Matches `render_single`'s
+/// single-scope text output, where the `%` hangs off the value, not the column.
+fn fmt_rate_pct(rate: Option<f64>) -> String {
+    match rate {
+        Some(_) => format!("{}%", fmt_rate(rate)),
+        None => "n/a".to_string(),
+    }
+}
+
+/// The single whole-scope summary (no grouping) — the original report shape.
+fn render_single<W: Write>(
+    r: &GroupResult,
+    currency: &str,
+    end_date: NaiveDate,
+    ctx: &DisplayContext,
+    format: &OutputFormat,
+    writer: &mut W,
+) -> Result<()> {
+    let money = |n: Decimal| ctx.format_amount_number(n, currency);
     match format {
         OutputFormat::Csv => {
             writeln!(
@@ -149,30 +473,26 @@ pub(super) fn report_returns<W: Write>(
                 "{},{},{},{},{},{},{},{}",
                 currency,
                 end_date,
-                flow_count,
-                csv_escape(&money(invested)),
-                csv_escape(&money(distributions)),
-                csv_escape(&money(current_value)),
-                rate.map_or_else(|| "n/a".to_string(), rate_pct),
-                twr_rate.map_or_else(|| "n/a".to_string(), rate_pct),
+                r.flow_count,
+                csv_escape(&money(r.invested)),
+                csv_escape(&money(r.distributions)),
+                csv_escape(&money(r.current_value)),
+                fmt_rate(r.mwr),
+                fmt_rate(r.twr),
             )?;
         }
         OutputFormat::Json => {
-            // Same 2-decimal precision as text/csv (a bare JSON number, `null`
-            // when undefined) so the rate agrees across every output format.
-            let rate_field = rate.map_or_else(|| "null".to_string(), rate_pct);
-            let twr_field = twr_rate.map_or_else(|| "null".to_string(), rate_pct);
             writeln!(
                 writer,
                 r#"{{"reporting_currency": "{}", "as_of": "{}", "cash_flows": {}, "invested": "{}", "distributions": "{}", "current_value": "{}", "money_weighted_return_pct": {}, "time_weighted_return_pct": {}}}"#,
                 json_escape(currency),
                 end_date,
-                flow_count,
-                money(invested),
-                money(distributions),
-                money(current_value),
-                rate_field,
-                twr_field,
+                r.flow_count,
+                money(r.invested),
+                money(r.distributions),
+                money(r.current_value),
+                json_rate(r.mwr),
+                json_rate(r.twr),
             )?;
         }
         OutputFormat::Text => {
@@ -181,40 +501,181 @@ pub(super) fn report_returns<W: Write>(
             writeln!(writer)?;
             writeln!(
                 writer,
-                "{:24}{} (as of {end_date})",
-                "Reporting currency", currency
+                "{:24}{currency} (as of {end_date})",
+                "Reporting currency"
             )?;
-            writeln!(writer, "{:24}{flow_count}", "Cash flows")?;
-            writeln!(writer, "{:24}{} {currency}", "Invested", money(invested))?;
+            writeln!(writer, "{:24}{}", "Cash flows", r.flow_count)?;
+            writeln!(writer, "{:24}{} {currency}", "Invested", money(r.invested))?;
             writeln!(
                 writer,
                 "{:24}{} {currency}",
                 "Distributions",
-                money(distributions)
+                money(r.distributions)
             )?;
             writeln!(
                 writer,
                 "{:24}{} {currency}",
                 "Current value",
-                money(current_value)
+                money(r.current_value)
             )?;
             writeln!(writer)?;
-            match rate {
-                Some(r) => writeln!(writer, "{:24}{}%", "Money-weighted return", rate_pct(r))?,
+            match r.mwr {
+                Some(rate) => writeln!(
+                    writer,
+                    "{:24}{}%",
+                    "Money-weighted return",
+                    fmt_rate(Some(rate))
+                )?,
                 None => writeln!(
                     writer,
                     "{:24}n/a (undefined — need at least one inflow and one outflow)",
                     "Money-weighted return"
                 )?,
             }
-            match twr_rate {
-                Some(r) => writeln!(writer, "{:24}{}%", "Time-weighted return", rate_pct(r))?,
+            match r.twr {
+                Some(rate) => writeln!(
+                    writer,
+                    "{:24}{}%",
+                    "Time-weighted return",
+                    fmt_rate(Some(rate))
+                )?,
                 None => writeln!(writer, "{:24}n/a", "Time-weighted return")?,
             }
         }
     }
-
     Ok(())
+}
+
+/// A JSON rate field: a bare 2-decimal number, or `null` when undefined.
+fn json_rate(rate: Option<f64>) -> String {
+    rate.map_or_else(|| "null".to_string(), |r| fmt_rate(Some(r)))
+}
+
+/// Per-group rows plus a TOTAL, when grouping is active.
+fn render_grouped<W: Write>(
+    groups: &[GroupResult],
+    total: &GroupResult,
+    currency: &str,
+    end_date: NaiveDate,
+    ctx: &DisplayContext,
+    format: &OutputFormat,
+    writer: &mut W,
+) -> Result<()> {
+    let money = |n: Decimal| ctx.format_amount_number(n, currency);
+    let rows = groups.iter().chain(std::iter::once(total));
+    match format {
+        OutputFormat::Csv => {
+            writeln!(
+                writer,
+                "group,as_of,reporting_currency,cash_flows,invested,distributions,current_value,money_weighted_return_pct,time_weighted_return_pct"
+            )?;
+            for r in rows {
+                writeln!(
+                    writer,
+                    "{},{},{},{},{},{},{},{},{}",
+                    csv_escape(&sanitize_display(&r.label)),
+                    end_date,
+                    currency,
+                    r.flow_count,
+                    csv_escape(&money(r.invested)),
+                    csv_escape(&money(r.distributions)),
+                    csv_escape(&money(r.current_value)),
+                    fmt_rate(r.mwr),
+                    fmt_rate(r.twr),
+                )?;
+            }
+        }
+        OutputFormat::Json => {
+            let obj = |r: &GroupResult| {
+                format!(
+                    r#"{{"group": "{}", "cash_flows": {}, "invested": "{}", "distributions": "{}", "current_value": "{}", "money_weighted_return_pct": {}, "time_weighted_return_pct": {}}}"#,
+                    json_escape(&r.label),
+                    r.flow_count,
+                    money(r.invested),
+                    money(r.distributions),
+                    money(r.current_value),
+                    json_rate(r.mwr),
+                    json_rate(r.twr),
+                )
+            };
+            let group_objs: Vec<String> = groups.iter().map(obj).collect();
+            writeln!(
+                writer,
+                r#"{{"reporting_currency": "{}", "as_of": "{}", "groups": [{}], "total": {}}}"#,
+                json_escape(currency),
+                end_date,
+                group_objs.join(", "),
+                obj(total),
+            )?;
+        }
+        OutputFormat::Text => {
+            // Rule width must match the column layout below (kept under 80 cols;
+            // the Distributions column is 14 so its header keeps a leading gap).
+            const RULE: usize = 23 + 9 + 9 + 12 + 14 + 12;
+            writeln!(writer, "Returns  ({currency}, as of {end_date})")?;
+            writeln!(writer, "{}", "=".repeat(RULE))?;
+            writeln!(writer)?;
+            writeln!(
+                writer,
+                "{:23}{:>9}{:>9}{:>12}{:>14}{:>12}",
+                "Group", "MWR", "TWR", "Invested", "Distributions", "Current"
+            )?;
+            writeln!(writer, "{}", "-".repeat(RULE))?;
+            let row = |w: &mut W, r: &GroupResult| -> Result<()> {
+                writeln!(
+                    w,
+                    "{:23}{:>9}{:>9}{:>12}{:>14}{:>12}",
+                    truncate(&r.label, 23),
+                    fmt_rate_pct(r.mwr),
+                    fmt_rate_pct(r.twr),
+                    money(r.invested),
+                    money(r.distributions),
+                    money(r.current_value),
+                )?;
+                Ok(())
+            };
+            for r in groups {
+                row(writer, r)?;
+            }
+            // Separate the group rows from the TOTAL — but not when there are no
+            // group rows (the no-tags case), which would print two rules back to
+            // back.
+            if !groups.is_empty() {
+                writeln!(writer, "{}", "-".repeat(RULE))?;
+            }
+            row(writer, total)?;
+            // The TOTAL is the whole portfolio, not the sum of the group rows
+            // (groups are independent and untagged holdings are omitted).
+            writeln!(
+                writer,
+                "Note: TOTAL is the whole portfolio, not the sum of the groups."
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Truncate a label to fit a text column (keeps the informative tail).
+///
+/// The label is first run through `sanitize_display` (control chars → space),
+/// so it can neither split the fixed-width row across lines nor inject a spoofed
+/// second line into the text report.
+fn truncate(s: &str, width: usize) -> String {
+    let s = sanitize_display(s);
+    let s = s.as_str();
+    if s.chars().count() <= width {
+        s.to_string()
+    } else {
+        let tail: String = s
+            .chars()
+            .rev()
+            .take(width - 1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("…{tail}")
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +689,15 @@ mod tests {
 
     fn money(n: i64, ccy: &str) -> Amount {
         Amount::new(Decimal::from(n), ccy)
+    }
+
+    /// An undefined rate renders as `n/a`, not `n/a%`: the `%` hangs off the
+    /// value (as in `render_single`), so the grouped text table stays consistent
+    /// with the single-scope output.
+    #[test]
+    fn undefined_rate_renders_without_a_percent_sign() {
+        assert_eq!(fmt_rate_pct(None), "n/a");
+        assert_eq!(fmt_rate_pct(Some(0.3236)), "32.36%");
     }
 
     /// Drift guard (CLAUDE.md Canonical-Function Discipline): `terminal_value`

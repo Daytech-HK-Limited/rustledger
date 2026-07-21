@@ -178,6 +178,12 @@ pub enum Report {
         /// Defaults to today.
         #[arg(short, long)]
         end: Option<String>,
+        /// Add one row per `returns-group:` group (declared on `open`
+        /// directives), each an independent sub-portfolio, alongside the
+        /// whole-portfolio total. Grouping is opt-in so the default output shape
+        /// is unchanged.
+        #[arg(long)]
+        by_group: bool,
     },
 }
 
@@ -478,6 +484,7 @@ fn render<W: io::Write>(
             income,
             currency,
             end,
+            by_group,
         } => {
             returns::report_returns(
                 balance_input,
@@ -486,6 +493,7 @@ fn render<W: io::Write>(
                 income,
                 currency.as_deref(),
                 end.as_deref(),
+                *by_group,
                 &loaded.display_context,
                 format,
                 writer,
@@ -541,11 +549,14 @@ pub(super) fn account_balances(
     engine.into_inventories().into_iter().collect()
 }
 
-// CSV/JSON escaping: single-sourced in core. `escape_string` escapes the
-// exact set the old hand-chained `json_escape` did (backslash, quote, \n,
-// \r, \t), so the alias is behavior-identical.
+// CSV/JSON escaping: single-sourced in core. `escape_json` is the RFC-8259
+// string escaper — the required escapes plus `\uXXXX` for every other C0
+// control byte — so report JSON stays valid even when a field carries a raw
+// control char (e.g. from metadata). Do NOT revert this to `escape_string`
+// (the beancount-source escaper leaves control bytes other than \n\t\r raw,
+// which is invalid JSON).
 pub(super) use rustledger_core::format::escape_csv as csv_escape;
-pub(super) use rustledger_core::format::escape_string as json_escape;
+pub(super) use rustledger_core::format::escape_json as json_escape;
 
 #[derive(Default)]
 pub(super) struct LedgerStats {
