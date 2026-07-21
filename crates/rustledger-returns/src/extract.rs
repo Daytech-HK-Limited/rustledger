@@ -674,19 +674,34 @@ pub fn twr(
     dates.push(end_date);
     let mut values = investment_values_at(directives, scope, reporting_currency, prices, &dates);
     // Split off the `end_date` valuation; `values` then has exactly one entry per
-    // flow date, in `net_by_date` order. Each value is a `Result`, propagated with
-    // `?` only at the flow it belongs to — so a `MissingPrice` at a later date is
-    // NOT raised when an earlier sub-period already made the return undefined
-    // (preserving the old lazy short-circuit).
+    // flow date, in `net_by_date` order.
     let end_value = values.pop().expect("dates always includes end_date");
+    twr_from_values(&net_by_date, values, end_value, end_date)
+}
 
-    // Chain the sub-period returns via unit accounting. `v_prev` is the portfolio
-    // value just after the previous valuation; on the first flow date it is only
-    // established (that flow is the opening capital, not a return).
+/// Chain the sub-period returns from portfolio valuations already realized.
+///
+/// The unit-value core of [`twr`], factored out so it can run over values
+/// snapshotted in a SINGLE forward pass — shared with [`compute_returns`], which
+/// derives MWR and the terminal value from the same realization. `flow_values[i]`
+/// is the portfolio value at the i-th flow date (in `net_by_date` order);
+/// `end_value` is the value at `end_date`. Each value is a `Result` so a
+/// `MissingPrice` at a later date is propagated only if the chain actually reaches
+/// it (`?` at the flow it belongs to), preserving the lazy short-circuit — an
+/// early undefined sub-period (`Ok(None)`) never surfaces a later price gap.
+fn twr_from_values(
+    net_by_date: &std::collections::BTreeMap<NaiveDate, Decimal>,
+    flow_values: Vec<Result<Decimal, ExtractError>>,
+    end_value: Result<Decimal, ExtractError>,
+    end_date: NaiveDate,
+) -> Result<Option<f64>, ExtractError> {
+    // `v_prev` is the portfolio value just after the previous valuation; on the
+    // first flow date it is only established (that flow is the opening capital,
+    // not a return).
     let mut cumulative = 1.0_f64;
     let mut v_prev: Option<f64> = None;
     let mut first_date: Option<NaiveDate> = None;
-    for ((&date, &contribution), value) in net_by_date.iter().zip(values) {
+    for ((&date, &contribution), value) in net_by_date.iter().zip(flow_values) {
         first_date.get_or_insert(date);
         // A Decimal that can't be represented as f64 makes the return undefined
         // (report n/a), never a silent 0 — which would fabricate a wrong rate.
@@ -736,13 +751,13 @@ pub fn twr(
         // nothing and contributes no return — the whole-period figure is already
         // in `cumulative` (a position closed out on the report date keeps its TWR).
         Some(_) => {}
-        None => return Ok(None), // unreachable: `flows` non-empty ⇒ the loop ran
+        None => return Ok(None), // no flows ⇒ nothing to chain
     }
 
     // Annualize the total return over [first_date, end_date] (actual/365, the
     // same day count as `xirr`). A zero-length span cannot be annualized.
     let Some(first_date) = first_date else {
-        return Ok(None); // unreachable: `flows` non-empty
+        return Ok(None); // no flows
     };
     let days = end_date.since(first_date).map_or(0, |s| s.get_days());
     if days <= 0 {
@@ -751,6 +766,118 @@ pub fn twr(
     let years = f64::from(days) / crate::DAYS_PER_YEAR;
     let annualized = cumulative.powf(1.0 / years) - 1.0;
     Ok(annualized.is_finite().then_some(annualized))
+}
+
+/// A scope's full return summary, computed in one pass by [`compute_returns`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Returns {
+    /// Number of dated cash flows in the money-weighted series — the boundary
+    /// flows plus the terminal market value, if nonzero.
+    pub cash_flows: usize,
+    /// Capital contributed: the sum of outlays (investor-negative flows, sign-flipped).
+    pub invested: Decimal,
+    /// Distributions received: dividends and sale proceeds (investor-positive flows).
+    pub distributions: Decimal,
+    /// Market value of the held position at `end_date`.
+    pub current_value: Decimal,
+    /// Money-weighted return (annualized XIRR); `None` when undefined.
+    pub money_weighted: Option<f64>,
+    /// Time-weighted return (annualized); `None` when undefined.
+    pub time_weighted: Option<f64>,
+}
+
+/// Compute a scope's full return summary from a single flow extraction and a
+/// single portfolio realization.
+///
+/// Folds [`extract_flows`], [`terminal_value`], [`xirr`](crate::xirr), and
+/// [`twr`] into one computation: the boundary flows are extracted once, and the
+/// portfolio is valued at every flow date and at `end_date` in one forward
+/// realization pass (on the date-sorted fast path — the report's stream is; an
+/// unsorted stream falls back to per-date valuation, see `investment_values_at`),
+/// then reused for the terminal value, the money-weighted series, and the
+/// time-weighted chaining. A caller needing every figure (the `report returns`
+/// breakdown, one call per group) thus avoids the ~2× extraction and ~2×
+/// realization of invoking those functions separately. The result is identical to
+/// composing them by hand — pinned by `compute_returns_matches_manual_composition`.
+///
+/// TWR is `None` for a scope that never held investment capital (an income-only
+/// group, or a holding opened but never bought): with no capital there is no
+/// holding period to weight, so a flat 0% would be fabricated.
+///
+/// # Errors
+///
+/// [`ExtractError::MissingPrice`] if a boundary flow or the `end_date` valuation
+/// cannot be priced in `reporting_currency`. A missing price at an *intermediate*
+/// flow date degrades TWR to `None` rather than erroring — the summary itself is
+/// still well-defined.
+///
+/// # Panics
+///
+/// Same booked, pad-expanded input requirement as [`twr`]. (Date-sorted input is
+/// a fast path, not a correctness requirement — an unsorted stream falls back to
+/// the order-independent per-date valuation.)
+pub fn compute_returns(
+    directives: &[Directive],
+    scope: &Scope,
+    reporting_currency: &str,
+    prices: &impl PriceOracle,
+    end_date: NaiveDate,
+) -> Result<Returns, ExtractError> {
+    let flows = extract_flows(directives, scope, reporting_currency, prices, end_date)?;
+    // One pass over the flows for all three derived quantities: capital in
+    // (outlays), distributions out, and the per-date net (portfolio-centric sign,
+    // so a contribution INTO the portfolio is positive) that drives TWR's
+    // sub-period boundaries.
+    let mut invested = Decimal::ZERO;
+    let mut distributions = Decimal::ZERO;
+    let mut net_by_date: std::collections::BTreeMap<NaiveDate, Decimal> =
+        std::collections::BTreeMap::new();
+    for flow in &flows {
+        if flow.amount.is_sign_negative() {
+            invested += -flow.amount;
+        } else {
+            distributions += flow.amount;
+        }
+        *net_by_date.entry(flow.date).or_default() += -flow.amount;
+    }
+
+    // One forward realization pass: value at every flow date and at `end_date`.
+    let mut dates: Vec<NaiveDate> = net_by_date.keys().copied().collect();
+    dates.push(end_date);
+    let mut values = investment_values_at(directives, scope, reporting_currency, prices, &dates);
+    let end_value = values.pop().expect("dates always includes end_date");
+    // The terminal is eager: a missing end-date price is a real gap in the summary
+    // (matches the old `terminal_value(..)?`).
+    let current_value = end_value?;
+
+    // Money-weighted: xirr over the boundary flows plus the terminal value. Only a
+    // nonzero terminal becomes a flow — a zero would defeat xirr's degenerate-date
+    // guard and fabricate a rate (see `terminal_value`).
+    let mut series = flows;
+    if !current_value.is_zero() {
+        series.push(CashFlow::new(end_date, current_value));
+    }
+    series.sort_by_key(|f| f.date);
+    let cash_flows = series.len();
+    let money_weighted = crate::xirr(&series);
+
+    // Time-weighted: chain from the values already realized above. `None` for a
+    // scope that never held capital (see the fn docs); a mid-stream price gap
+    // degrades to `None` rather than erroring.
+    let time_weighted = if invested.is_zero() && current_value.is_zero() {
+        None
+    } else {
+        twr_from_values(&net_by_date, values, Ok(current_value), end_date).unwrap_or(None)
+    };
+
+    Ok(Returns {
+        cash_flows,
+        invested,
+        distributions,
+        current_value,
+        money_weighted,
+        time_weighted,
+    })
 }
 
 #[cfg(test)]
@@ -1789,5 +1916,164 @@ mod tests {
         // The value at January is the January buy only — a broken cursor would
         // have reported 0 here.
         assert_eq!(batch[0], dec!(1000)); // 10 @ 100
+    }
+
+    /// Assert `compute_returns` equals the by-hand composition it replaced
+    /// (`extract_flows` + `terminal_value` + `xirr` + `twr`, with the zero-capital
+    /// TWR guard) AND that its money-weighted series matches the canonical
+    /// `extract_cash_flows`. Returns the computed `Returns` so callers can pin the
+    /// concrete figures for their shape.
+    fn assert_compute_returns_matches_composition(
+        dirs: &[Directive],
+        prices: &MockPrices,
+        scope: &Scope,
+        end: NaiveDate,
+    ) -> Returns {
+        let flows = extract_flows(dirs, scope, "USD", prices, end).unwrap();
+        let terminal = terminal_value(dirs, scope, "USD", prices, end).unwrap();
+        let invested: Decimal = flows
+            .iter()
+            .filter(|f| f.amount.is_sign_negative())
+            .map(|f| -f.amount)
+            .sum();
+        let distributions: Decimal = flows
+            .iter()
+            .filter(|f| f.amount.is_sign_positive())
+            .map(|f| f.amount)
+            .sum();
+        let current_value = terminal.map_or(Decimal::ZERO, |t| t.amount);
+        let mut series = flows;
+        if let Some(t) = terminal {
+            series.push(t);
+        }
+        series.sort_by_key(|f| f.date);
+        let mwr = crate::xirr(&series);
+        let twr_rate = if invested.is_zero() && current_value.is_zero() {
+            None
+        } else {
+            twr(dirs, scope, "USD", prices, end).unwrap_or(None)
+        };
+
+        let r = compute_returns(dirs, scope, "USD", prices, end).unwrap();
+        assert_eq!(r.cash_flows, series.len(), "cash_flows");
+        assert_eq!(r.invested, invested, "invested");
+        assert_eq!(r.distributions, distributions, "distributions");
+        assert_eq!(r.current_value, current_value, "current_value");
+        assert_eq!(r.money_weighted, mwr, "money_weighted");
+        assert_eq!(r.time_weighted, twr_rate, "time_weighted");
+        // Canonical-series guard: the MWR series `compute_returns` open-codes must
+        // match `extract_cash_flows` (the canonical flows+terminal+sort assembler).
+        let canonical = extract_cash_flows(dirs, scope, "USD", prices, end).unwrap();
+        assert_eq!(
+            r.money_weighted,
+            crate::xirr(&canonical),
+            "MWR diverged from the canonical extract_cash_flows series"
+        );
+        r
+    }
+
+    /// Drift guard (CLAUDE.md Canonical-Function Discipline): `compute_returns`
+    /// must equal the by-hand composition it replaced, across the shapes that hit
+    /// its distinct branches — the happy path is not enough (a broken zero-terminal
+    /// suppression or a narrowed zero-capital guard hides in the all-nonzero case).
+    #[test]
+    fn compute_returns_matches_manual_composition() {
+        let scope = invest_scope();
+        let end = d(2020, 12, 31);
+
+        // (a) Happy path: buy + dividend-inclusive holding — every field non-trivial.
+        let happy = vec![
+            txn(
+                d(2020, 1, 1),
+                vec![
+                    Posting::new("Assets:Broker:Stock", amt(dec!(10), "AAPL")),
+                    Posting::new("Assets:Bank", amt(dec!(-1000), "USD")),
+                ],
+            ),
+            txn(
+                d(2020, 6, 1),
+                vec![
+                    Posting::new("Assets:Bank", amt(dec!(20), "USD")),
+                    Posting::new("Income:Dividends", amt(dec!(-20), "USD")),
+                ],
+            ),
+        ];
+        let happy_prices = MockPrices::default()
+            .with("AAPL", "USD", d(2020, 1, 1), dec!(100))
+            .with("AAPL", "USD", d(2020, 6, 1), dec!(110))
+            .with("AAPL", "USD", d(2020, 12, 31), dec!(130));
+        let r = assert_compute_returns_matches_composition(&happy, &happy_prices, &scope, end);
+        assert_eq!(r.invested, dec!(1000));
+        assert_eq!(r.distributions, dec!(20));
+        assert_eq!(r.current_value, dec!(1300));
+        assert!(r.money_weighted.is_some() && r.time_weighted.is_some());
+
+        // (b) Income-only: a dividend, no holding — exercises the zero-capital TWR
+        // guard (twr() alone would fabricate 0%) and the zero-terminal suppression.
+        let income_only = vec![txn(
+            d(2020, 6, 1),
+            vec![
+                Posting::new("Assets:Bank", amt(dec!(20), "USD")),
+                Posting::new("Income:Dividends", amt(dec!(-20), "USD")),
+            ],
+        )];
+        let r = assert_compute_returns_matches_composition(
+            &income_only,
+            &MockPrices::default(),
+            &scope,
+            end,
+        );
+        assert_eq!(r.invested, dec!(0));
+        assert_eq!(r.distributions, dec!(20));
+        assert_eq!(r.current_value, dec!(0));
+        assert_eq!(
+            r.time_weighted, None,
+            "zero-capital TWR must be None, not 0%"
+        );
+
+        // (c) Worthless terminal: a holding priced to zero at the end — exercises
+        // the zero-terminal suppression (no terminal flow, current_value 0).
+        let worthless = vec![txn(
+            d(2020, 1, 1),
+            vec![
+                Posting::new("Assets:Broker:Stock", amt(dec!(10), "AAPL")),
+                Posting::new("Assets:Bank", amt(dec!(-1000), "USD")),
+            ],
+        )];
+        let worthless_prices = MockPrices::default()
+            .with("AAPL", "USD", d(2020, 1, 1), dec!(100))
+            .with("AAPL", "USD", d(2020, 12, 31), dec!(0));
+        let r =
+            assert_compute_returns_matches_composition(&worthless, &worthless_prices, &scope, end);
+        assert_eq!(r.invested, dec!(1000));
+        assert_eq!(
+            r.current_value,
+            dec!(0),
+            "a worthless holding suppresses the terminal"
+        );
+    }
+
+    /// `compute_returns` errors eagerly on a missing `end_date` price, exactly as
+    /// the old `terminal_value(..)?` did — a report can't state a summary it can't
+    /// value at the horizon.
+    #[test]
+    fn compute_returns_errors_on_missing_end_price_like_terminal_value() {
+        let dirs = vec![txn(
+            d(2020, 1, 1),
+            vec![
+                Posting::new("Assets:Broker:Stock", amt(dec!(10), "AAPL")),
+                Posting::new("Assets:Bank", amt(dec!(-1000), "USD")),
+            ],
+        )];
+        // Priced at the buy (so extract_flows/the flow-date valuation succeed) but
+        // NOT at the report end date.
+        let prices = MockPrices::default().with("AAPL", "USD", d(2020, 1, 1), dec!(100));
+        let scope = invest_scope();
+        let end = d(2020, 12, 31);
+        assert!(terminal_value(&dirs, &scope, "USD", &prices, end).is_err());
+        assert!(
+            compute_returns(&dirs, &scope, "USD", &prices, end).is_err(),
+            "a missing end-date price must error, matching terminal_value"
+        );
     }
 }

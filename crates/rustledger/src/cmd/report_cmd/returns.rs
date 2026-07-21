@@ -51,9 +51,7 @@ use rustledger_core::{
     Amount, Directive, DisplayContext, MetaValue, NaiveDate, is_subaccount_or_equal,
 };
 use rustledger_query::PriceDatabase;
-use rustledger_returns::{
-    AccountRole, PriceOracle, Scope, extract_flows, terminal_value, twr, xirr,
-};
+use rustledger_returns::{AccountRole, PriceOracle, Scope, compute_returns};
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -88,11 +86,11 @@ struct GroupResult {
 
 /// Compute the return summary for one scope.
 ///
-/// Extracts the boundary flows and terminal value separately (so the summary can
-/// report capital-in / distributions / current-value), then runs xirr over the
-/// combined, date-sorted series and twr over the same directives. The manual
-/// flows+terminal combine mirrors the engine's canonical `extract_cash_flows`
-/// and is pinned by the `series_matches_extract_cash_flows` test.
+/// Delegates to the engine's `compute_returns`, which extracts the boundary flows
+/// and realizes the portfolio ONCE. Previously this consumer composed
+/// `extract_flows` + `terminal_value` + `twr`, and `twr` itself re-ran
+/// `extract_flows` and a second realization — so each group did ~2 extractions and
+/// ~2 realizations. This adds only the row `label`.
 fn compute_group(
     directives: &[Directive],
     scope: &Scope,
@@ -101,49 +99,16 @@ fn compute_group(
     end_date: NaiveDate,
     label: String,
 ) -> Result<GroupResult> {
-    let flows = extract_flows(directives, scope, reporting_currency, prices, end_date)
-        .context("extracting investment cash flows")?;
-    let terminal = terminal_value(directives, scope, reporting_currency, prices, end_date)
-        .context("valuing the held position at the report date")?;
-
-    let invested: Decimal = flows
-        .iter()
-        .filter(|f| f.amount.is_sign_negative())
-        .map(|f| -f.amount)
-        .sum();
-    let distributions: Decimal = flows
-        .iter()
-        .filter(|f| f.amount.is_sign_positive())
-        .map(|f| f.amount)
-        .sum();
-    let current_value: Decimal = terminal.map_or(Decimal::ZERO, |t| t.amount);
-
-    let mut series = flows;
-    if let Some(t) = terminal {
-        series.push(t);
-    }
-    series.sort_by_key(|f| f.date);
-    let flow_count = series.len();
-    let mwr = xirr(&series);
-    // A scope that never held investment capital (an income-only group, or a
-    // holding opened but never bought) has no holding period to weight: TWR is
-    // undefined, not a flat 0%. `twr`'s unit-chaining would otherwise return
-    // `Some(0.0)` over the empty position. (`xirr` already yields `None` here.)
-    let twr_rate = if invested.is_zero() && current_value.is_zero() {
-        None
-    } else {
-        // TWR needs a price at every flow date; degrade to n/a rather than error.
-        twr(directives, scope, reporting_currency, prices, end_date).unwrap_or(None)
-    };
-
+    let r = compute_returns(directives, scope, reporting_currency, prices, end_date)
+        .context("computing investment returns for the scope")?;
     Ok(GroupResult {
         label,
-        flow_count,
-        invested,
-        distributions,
-        current_value,
-        mwr,
-        twr: twr_rate,
+        flow_count: r.cash_flows,
+        invested: r.invested,
+        distributions: r.distributions,
+        current_value: r.current_value,
+        mwr: r.money_weighted,
+        twr: r.time_weighted,
     })
 }
 
@@ -682,6 +647,9 @@ fn truncate(s: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use rustledger_core::{Posting, Price, Transaction, naive_date};
+    // The drift guards below compare against the engine's individual primitives,
+    // which the production path no longer imports (it uses `compute_returns`).
+    use rustledger_returns::{extract_flows, terminal_value};
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         naive_date(y, m, day).unwrap()
@@ -755,12 +723,15 @@ mod tests {
         assert_eq!(tv.amount, Decimal::from(2250));
     }
 
-    /// Drift guard: `report_returns` builds the xirr series by hand from
-    /// `extract_flows` + `terminal_value` (it needs the parts for the summary
-    /// breakdown). That manual combine must stay equal to the engine's canonical
-    /// `extract_cash_flows`; if the engine changes how it assembles the series
-    /// (coalescing, a sort tie-break, …), this trips so the CLI is updated in
-    /// lockstep rather than silently drifting.
+    /// Drift guard for the money-weighted series assembly `flows + terminal + sort`.
+    ///
+    /// The production series now lives in the engine's `compute_returns` (which
+    /// open-codes this combine to avoid re-extracting); that copy is pinned against
+    /// `extract_cash_flows` by the engine's own
+    /// `compute_returns_matches_manual_composition`. This test keeps a second,
+    /// independent check that the canonical `extract_cash_flows` assembler itself
+    /// still equals `flows + terminal + sort` — the shape both the engine and any
+    /// future consumer rely on.
     #[test]
     fn series_matches_extract_cash_flows() {
         let dirs = vec![
