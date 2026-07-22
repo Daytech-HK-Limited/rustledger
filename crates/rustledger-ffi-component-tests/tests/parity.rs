@@ -713,6 +713,92 @@ fn session_format_honors_display_precision() -> Result<()> {
     Ok(())
 }
 
+/// `session.returns` (WIT 3.9.0, #1847): the component's returns over the held
+/// ledger must equal the NATIVE `rustledger_query::scope_returns` over the same
+/// booked, pad-expanded stream — the SAME composition the CLI's `report returns`
+/// calls, so this pins the wasm surface against the CLI's returns path, not a
+/// private re-implementation. Drift guard across the wasm boundary: the decimal
+/// fields (rust_decimal, pure integer arithmetic) must match byte-for-byte; the
+/// two `f64` rates are compared within a tolerance, since wasm and native float
+/// can differ by an ULP in the XIRR/TWR iteration.
+#[test]
+fn session_returns_matches_native_engine() -> Result<()> {
+    if !component_path().exists() {
+        eprintln!("skip: component wasm not built");
+        return Ok(());
+    }
+    const LEDGER: &str = "\
+option \"operating_currency\" \"USD\"
+2020-01-01 open Assets:Invest:Broker
+2020-01-01 open Assets:Cash
+2020-01-01 open Income:Dividends
+2020-01-01 * \"Buy 10 ACME\"
+  Assets:Invest:Broker  10 ACME {100 USD}
+  Assets:Cash
+2020-07-01 * \"Dividend\"
+  Assets:Cash  20 USD
+  Income:Dividends
+2021-01-01 price ACME  120 USD
+";
+    let investments = vec!["Assets:Invest".to_string()];
+    let income = vec!["Income".to_string()];
+
+    // Component side: hold the ledger and ask for returns over the boundary.
+    let (mut store, inst) = instantiate()?;
+    let session = inst.rustledger_ledger_ledger().session();
+    let handle = session.call_constructor(&mut store, LEDGER)?;
+    let via = session
+        .call_returns(
+            &mut store,
+            handle,
+            &investments,
+            &income,
+            "USD",
+            "2021-01-01",
+        )?
+        .map_err(|e| anyhow::anyhow!("returns failed: {e}"))?;
+    handle.resource_drop(&mut store)?;
+
+    // Native reference: the shared helper both the CLI and the component call.
+    let native = rustledger_ffi_wasi::helpers::load_source(LEDGER);
+    assert!(
+        native.errors.is_empty(),
+        "fixture must load without errors ({} found)",
+        native.errors.len()
+    );
+    let padded = rustledger_booking::merge_with_padding(&native.directives);
+    let scope = rustledger_returns::Scope::new(investments.clone(), income.clone());
+    let end = "2021-01-01".parse().expect("date");
+    let direct = rustledger_query::scope_returns(&padded, &scope, "USD", end)
+        .expect("native engine computes");
+
+    // Decimal fields: exact (rust_decimal is deterministic across targets).
+    assert_eq!(via.cash_flows, u32::try_from(direct.cash_flows).unwrap());
+    assert_eq!(via.invested, direct.invested.to_string());
+    assert_eq!(via.distributions, direct.distributions.to_string());
+    assert_eq!(via.current_value, direct.current_value.to_string());
+
+    // Rates: within tolerance (wasm vs native float).
+    let approx = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+        (None, None) => true,
+        _ => false,
+    };
+    assert!(
+        approx(via.money_weighted, direct.money_weighted),
+        "MWR drift: component {:?} vs native {:?}",
+        via.money_weighted,
+        direct.money_weighted
+    );
+    assert!(
+        approx(via.time_weighted, direct.time_weighted),
+        "TWR drift: component {:?} vs native {:?}",
+        via.time_weighted,
+        direct.time_weighted
+    );
+    Ok(())
+}
+
 /// The stateful `resource session` (#173): construct once, then info/query/
 /// clamp run against the held ledger. Crucially `clamp` operates on the held
 /// core directives, so cost basis survives with no WIT->core->WIT round-trip.

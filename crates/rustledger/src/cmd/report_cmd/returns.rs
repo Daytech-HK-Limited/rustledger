@@ -47,29 +47,11 @@
 use super::{OutputFormat, csv_escape, json_escape};
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
-use rustledger_core::{
-    Amount, Directive, DisplayContext, MetaValue, NaiveDate, is_subaccount_or_equal,
-};
-use rustledger_query::PriceDatabase;
-use rustledger_returns::{AccountRole, PriceOracle, Scope, compute_returns, compute_returns_multi};
+use rustledger_core::{Directive, DisplayContext, MetaValue, NaiveDate, is_subaccount_or_equal};
+use rustledger_query::{scope_returns, scopes_returns};
+use rustledger_returns::{AccountRole, Scope};
 use std::collections::BTreeMap;
 use std::io::Write;
-
-/// Adapts the query engine's [`PriceDatabase`] to the returns engine's
-/// [`PriceOracle`] trait.
-///
-/// The `convert` signatures are identical, so this is a pass-through. It lives
-/// here at the composition root — where the CLI is the only place the two crates
-/// meet — deliberately: `rustledger-returns` stays a leaf (no dependency on the
-/// query engine that owns the price index), and `rustledger-query` stays free of
-/// a returns dependency.
-pub(super) struct PriceDbOracle<'a>(pub(super) &'a PriceDatabase);
-
-impl PriceOracle for PriceDbOracle<'_> {
-    fn convert(&self, amount: &Amount, to_currency: &str, date: NaiveDate) -> Option<Amount> {
-        self.0.convert(amount, to_currency, date)
-    }
-}
 
 /// The computed return figures for one scope (a group, or the whole portfolio).
 struct GroupResult {
@@ -86,20 +68,18 @@ struct GroupResult {
 
 /// Compute the return summary for one scope.
 ///
-/// Delegates to the engine's `compute_returns`, which extracts the boundary flows
-/// and realizes the portfolio ONCE. Previously this consumer composed
-/// `extract_flows` + `terminal_value` + `twr`, and `twr` itself re-ran
-/// `extract_flows` and a second realization — so each group did ~2 extractions and
-/// ~2 realizations. This adds only the row `label`.
+/// Delegates to [`rustledger_query::scope_returns`] — the composition shared with
+/// the component's `session.returns`, which builds the price index and calls the
+/// engine's `compute_returns` (one extraction + one realization per scope). This
+/// adds only the row `label`.
 fn compute_group(
     directives: &[Directive],
     scope: &Scope,
     reporting_currency: &str,
-    prices: &impl PriceOracle,
     end_date: NaiveDate,
     label: String,
 ) -> Result<GroupResult> {
-    let r = compute_returns(directives, scope, reporting_currency, prices, end_date)
+    let r = scope_returns(directives, scope, reporting_currency, end_date)
         .with_context(|| format!("computing investment returns for {label}"))?;
     Ok(GroupResult {
         label,
@@ -407,18 +387,12 @@ pub(super) fn report_returns<W: Write>(
     };
 
     let whole_scope = Scope::new(investments.to_vec(), income.to_vec());
-    // Price index built from the same stream, so implicit transaction prices and
-    // explicit `price` directives both feed the valuation.
-    let price_db = PriceDatabase::from_directives(directives);
-    let oracle = PriceDbOracle(&price_db);
-
     let currency = reporting_currency.as_str();
     if !by_group {
         let total = compute_group(
             directives,
             &whole_scope,
             &reporting_currency,
-            &oracle,
             end_date,
             "TOTAL".to_string(),
         )?;
@@ -441,7 +415,6 @@ pub(super) fn report_returns<W: Write>(
             directives,
             &whole_scope,
             &reporting_currency,
-            &oracle,
             end_date,
             "TOTAL".to_string(),
         )?;
@@ -460,8 +433,7 @@ pub(super) fn report_returns<W: Write>(
         labels.push(label);
         scopes.push(scope);
     }
-    let computed =
-        compute_returns_multi(directives, &scopes, &reporting_currency, &oracle, end_date);
+    let computed = scopes_returns(directives, &scopes, &reporting_currency, end_date);
 
     let mut rows: Vec<GroupResult> = Vec::with_capacity(computed.len());
     for (result, label) in computed.into_iter().zip(labels) {
@@ -735,10 +707,15 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustledger_core::{Posting, Price, Transaction, naive_date};
-    // The drift guards below compare against the engine's individual primitives,
-    // which the production path no longer imports (it uses `compute_returns`).
-    use rustledger_returns::{extract_flows, terminal_value};
+    use rustledger_core::{Amount, Posting, Price, Transaction, naive_date};
+    use rustledger_query::PriceDatabase;
+    // The drift guards below exercise the engine's individual primitives
+    // (`terminal_value` / `extract_flows` / `extract_cash_flows`), which the
+    // production path no longer imports (it uses the shared
+    // `rustledger_query::scope_returns`). They obtain a `PriceOracle` from the
+    // canonical `PriceDatabase::as_oracle()`; `PriceOracle` is in scope to call
+    // `.convert` on it directly.
+    use rustledger_returns::{PriceOracle, extract_flows, terminal_value};
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         naive_date(y, m, day).unwrap()
@@ -783,7 +760,7 @@ mod tests {
         ];
         let end = d(2020, 12, 31);
         let price_db = PriceDatabase::from_directives(&dirs);
-        let oracle = PriceDbOracle(&price_db);
+        let oracle = price_db.as_oracle();
 
         // Independently value `account_balances`' inventories at market for the
         // same scope, then compare to `terminal_value`.
@@ -845,7 +822,7 @@ mod tests {
             vec!["Income:Dividends".to_string()],
         );
         let price_db = PriceDatabase::from_directives(&dirs);
-        let oracle = PriceDbOracle(&price_db);
+        let oracle = price_db.as_oracle();
 
         // Reproduce report_returns' hand-built series.
         let flows = extract_flows(&dirs, &scope, "USD", &oracle, end).unwrap();
@@ -864,6 +841,46 @@ mod tests {
         );
         // Guard against a vacuous pass: the series is the three expected flows.
         assert_eq!(canonical.len(), 3);
+    }
+
+    /// The CLI `report returns` path (`compute_group` -> `scope_returns`) must
+    /// return a clean error, NOT trap, when the loaded ledger carries a
+    /// booking-failed (un-booked, re-merged) transaction — the pre-existing CLI
+    /// exposure the #1849 third review flagged, now closed by the returns
+    /// engine's fallible `try_apply`. Over-reduce an empty-cost lot (sell 10 of a
+    /// 5-lot); without the fix this native test would abort.
+    #[test]
+    fn compute_group_errors_on_unbooked_oversell_not_traps() {
+        use rustledger_core::{CostNumber, CostSpec};
+        let dirs = vec![
+            Directive::Transaction(
+                Transaction::new(d(2020, 1, 1), "buy")
+                    .with_synthesized_posting(
+                        Posting::new("Assets:Broker:Stock", money(5, "AAPL")).with_cost(
+                            CostSpec::empty()
+                                .with_number(CostNumber::PerUnit {
+                                    value: Decimal::from(100),
+                                })
+                                .with_currency("USD"),
+                        ),
+                    )
+                    .with_synthesized_posting(Posting::new("Assets:Bank", money(-500, "USD"))),
+            ),
+            Directive::Transaction(
+                Transaction::new(d(2020, 6, 1), "oversell")
+                    .with_synthesized_posting(
+                        Posting::new("Assets:Broker:Stock", money(-10, "AAPL"))
+                            .with_cost(CostSpec::empty()),
+                    )
+                    .with_synthesized_posting(Posting::new("Assets:Bank", money(1000, "USD"))),
+            ),
+        ];
+        let scope = Scope::new(vec!["Assets:Broker".to_string()], vec![]);
+        let r = compute_group(&dirs, &scope, "USD", d(2020, 12, 31), "TOTAL".to_string());
+        assert!(
+            r.is_err(),
+            "the CLI report path must error (not trap) on an un-booked over-sell"
+        );
     }
 
     /// Drift guard (CLAUDE.md Canonical-Function Discipline): the batched
