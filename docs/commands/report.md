@@ -319,6 +319,70 @@ TOTAL       net realized gain          660 USD
 | `--year <YYYY>` | Only disposals in this calendar/tax year. |
 | `--end <YYYY-MM-DD>` | Exclude disposals after this date. |
 | `--long-term-days <N>` | Override the long-term threshold with a fixed day count (held strictly more than `N` days is long-term). |
+| `--irr` | Add the annualized realized return of each closed lot, plus a pooled rate per term and currency (see below). |
+
+**Realized IRR (`--irr`).**
+
+Each closed lot is a round trip — money out at acquisition, money back at sale — so
+it has an annualized money-weighted return:
+
+```bash
+rledger report ledger.beancount capgains --irr
+```
+
+```text
+Sold       Commodity / account        Units  Acquired    Term       Proceeds           Gain       IRR
+-----------------------------------------------------------------------------------------------------
+2020-12-31 AAA Stock                     10  2020-01-01    ST           1250            250    25.00%
+2021-12-31 BBB Stock                     10  2020-01-01    LT           1440            440    20.00%
+-----------------------------------------------------------------------------------------------------
+Short-term    1 disposals   proceeds            1250   gain             250 USD   IRR 25.00%
+Long-term     1 disposals   proceeds            1440   gain             440 USD   IRR 20.00%
+TOTAL       net realized gain             690 USD   IRR 21.67%
+```
+
+The second lot gained 44% in total but reads 20% — the rate is *annualized*, so a
+1.44× return over two years is 20%/year compounded. The summary rates pool every
+eligible lot's flows into one series and solve once (a money-weighted return over
+all the capital that cycled through), which is why the TOTAL is 21.67% and not the
+22.50% average of the two rates.
+
+When some lots in a bucket have no defined rate, the summary says so explicitly —
+`IRR 25.00% (1 of 3 lots)` — because the disposal count, proceeds and gain on that
+line cover *every* lot while the rate can only cover the eligible ones.
+
+> **This is a realized-only return.** It can only see lots you actually closed, so
+> it is **not** your portfolio's total return — a position you still hold
+> contributes nothing, however it has performed. For the total return including
+> unrealized holdings valued at market, use [`report returns`](#investment-returns)
+> (money-weighted **and** time-weighted). The two answer different questions:
+> `returns` is the portfolio-level view; this is the per-lot view.
+
+A lot shows `n/a` (and is excluded from the pooled rates) when the rate is
+undefined: **short sales** (money-in-then-out makes an IRR unconventional and
+misleading), lots with **no acquisition date** (e.g. under `AVERAGE` booking, which
+merges lots and drops their dates), **same-day round trips** (a zero-day holding
+cannot be annualized), a non-positive cost basis, and negative proceeds. A **total
+loss** is *not* undefined — it is exactly `-100.00%` at any horizon, and it stays in
+the pooled rate, since dropping it would flatter the result by hiding capital that
+never came back.
+
+In CSV and JSON the rate is a 2-decimal **percent** in an `irr_pct` field (empty /
+`null` when undefined) — the same unit as `report returns`' `money_weighted_return_pct`,
+so the two reports' rates are directly comparable. The JSON summaries also carry
+`irr_lots` / `irr_lots_total` (the rate's coverage).
+
+A very short hold annualizes to an enormous number — a one-day 20% gain compounds to
+about 8×10³⁰ %/yr, arithmetically true but meaningless, and far more digits than a
+consumer (or this project's own decimal type) can read back. Rates **above 9999%**
+are therefore shown as `>9999%` in the text table and reported as empty / `null` in
+CSV/JSON, rather than as a fabricated figure. There is no lower cap: a round trip
+cannot lose more than its basis, so no rate falls below -100%.
+
+With `--year` or `--end`, the rate is computed from the flows of the lots that
+*closed* in the window; a lot bought in 2019 and sold in 2024 contributes its full
+five-year span to a `--year 2024` rate. The rate answers "what did the round trips
+I closed in this window earn, annualized", not "what did this window earn".
 
 **How it works.**
 

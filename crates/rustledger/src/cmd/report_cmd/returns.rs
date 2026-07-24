@@ -563,7 +563,10 @@ pub(super) fn report_returns<W: Write>(
 
 /// Format a rate as a 2-decimal percentage string, or `"n/a"` when undefined.
 /// A rate rounding to zero renders a clean `"0.00"` (not `"-0.00"`).
-fn fmt_rate(rate: Option<f64>) -> String {
+///
+/// Shared with the capgains report's realized-IRR columns so every rate this CLI
+/// prints uses one unit (percent) and one precision.
+pub(super) fn fmt_rate(rate: Option<f64>) -> String {
     rate.map_or_else(
         || "n/a".to_string(),
         |r| {
@@ -574,10 +577,13 @@ fn fmt_rate(rate: Option<f64>) -> String {
     )
 }
 
-/// A rate for the grouped **text** table: the numeric rate carries its own `%`,
-/// but an undefined rate is `n/a` (not `n/a%`). Matches `render_single`'s
-/// single-scope text output, where the `%` hangs off the value, not the column.
-fn fmt_rate_pct(rate: Option<f64>) -> String {
+/// A rate for a **text** table: the numeric rate carries its own `%`, but an
+/// undefined rate is `n/a` (not `n/a%`). Matches `render_single`'s single-scope
+/// text output, where the `%` hangs off the value, not the column.
+///
+/// Shared with the capgains report's realized-IRR column so the two rate columns
+/// cannot drift in formatting.
+pub(super) fn fmt_rate_pct(rate: Option<f64>) -> String {
     match rate {
         Some(_) => format!("{}%", fmt_rate(rate)),
         None => "n/a".to_string(),
@@ -679,7 +685,7 @@ fn render_single<W: Write>(
 }
 
 /// A JSON rate field: a bare 2-decimal number, or `null` when undefined.
-fn json_rate(rate: Option<f64>) -> String {
+pub(super) fn json_rate(rate: Option<f64>) -> String {
     rate.map_or_else(|| "null".to_string(), |r| fmt_rate(Some(r)))
 }
 
