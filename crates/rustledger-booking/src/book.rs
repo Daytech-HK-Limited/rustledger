@@ -9,8 +9,8 @@
 // ratchet: fxhash-only — hot path; use FxHashMap/FxHashSet, not std SipHash collections (#1237).
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustledger_core::{
-    AccountedBookingError, Amount, BookingMethod, Cost, CostSpec, Directive, IncompleteAmount,
-    Inventory, Position, Posting, ReductionScope, Transaction,
+    AccountedBookingError, Amount, BookingMethod, Cost, CostSpec, Decimal, Directive,
+    IncompleteAmount, Inventory, Position, Posting, ReductionScope, Transaction,
 };
 use thiserror::Error;
 
@@ -58,19 +58,39 @@ pub struct BookedTransaction {
     pub booked_indices: Vec<usize>,
 }
 
-/// A capital gain or loss from a lot sale.
+/// A realized capital gain or loss from disposing of **one lot**.
+///
+/// A sale that crosses several lots produces one `CapitalGain` per matched lot,
+/// so each is a self-contained disposal (units, cost basis, proceeds, acquisition
+/// date) — the shape tax reporting needs (a Form 8949 line per lot). The gain is
+/// only recorded for a reduction that carries a sale `@`price; a costless transfer
+/// of a lot is not a disposal.
 #[derive(Debug, Clone)]
 pub struct CapitalGain {
     /// The account holding the asset.
     pub account: rustledger_core::Account,
     /// The currency of the asset.
     pub currency: rustledger_core::Currency,
-    /// The gain amount (positive) or loss (negative).
-    pub amount: Amount,
-    /// Cost basis of the sold lot.
+    /// Units of this lot disposed of (always positive).
+    pub units: Decimal,
+    /// Cost basis of this lot (units × per-unit cost), in the lot's cost currency.
     pub cost_basis: Amount,
-    /// Sale proceeds.
+    /// Sale proceeds attributable to this lot, in the sale-price currency. Equals
+    /// the cost-basis currency for an ordinary same-currency disposal; a consumer
+    /// derives the realized gain as `proceeds − cost_basis` when the two currencies
+    /// match (they cannot be subtracted across currencies without an FX rate — that
+    /// policy is the consumer's, not the booking engine's).
     pub proceeds: Amount,
+    /// The date of the disposing transaction (the sale/cover date).
+    pub sale_date: rustledger_core::NaiveDate,
+    /// Acquisition date of the lot, when the lot carried one (the holding-period
+    /// start for short vs long term classification).
+    pub acquired_date: Option<rustledger_core::NaiveDate>,
+    /// True when this disposal CLOSES A SHORT position (the matched lot had
+    /// negative units): the lot's cost is the price the units were sold at when
+    /// the short was opened, so `proceeds`/`cost_basis` are assigned accordingly.
+    /// US tax treats short-sale gains as always short-term.
+    pub short_sale: bool,
 }
 
 /// Booking engine that tracks inventory across transactions.
@@ -383,30 +403,81 @@ impl BookingEngine {
                                 });
                                 booked_indices.insert(idx);
                             }
+                        }
 
-                            // Calculate capital gain if there's a price
-                            if let Some(cost_basis) = &booking_result.cost_basis
-                                && let Some(price) = &posting.price
-                                && let Some(amt) =
-                                    price.amount.as_ref().and_then(IncompleteAmount::as_amount)
-                            {
-                                let sale_price = match price.kind {
-                                    rustledger_core::PriceKind::Unit => {
-                                        amt.number * units.number.abs()
+                        // Realized capital gains, per matched lot, for a reduction
+                        // that carries a sale `@`price. Iterating `matched` covers
+                        // the single-lot AND multi-lot (expanded) cases uniformly, so
+                        // a sale crossing several lots yields one disposal per lot,
+                        // each with its own acquisition date and cost basis (the
+                        // shape tax reporting needs). A costless transfer of a lot
+                        // (no price) is not a disposal, so it records nothing.
+                        if let Some(price) = &posting.price
+                            && let Some(amt) =
+                                price.amount.as_ref().and_then(IncompleteAmount::as_amount)
+                            // A zero-unit reduction is degenerate — no proceeds to
+                            // pro-rate — so record no disposal (guards the `@@`
+                            // division too).
+                            && !units.number.is_zero()
+                        {
+                            let total_units = units.number.abs();
+                            for m in &booking_result.matched {
+                                // A matched cost-bearing lot always carries a cost; skip a
+                                // (defensive) cost-less one since it has no basis. The
+                                // cost and sale currencies are recorded as-is — a
+                                // cross-currency disposal (sale price in a different
+                                // currency than the lot's cost) is NOT dropped here; whether
+                                // its `proceeds − cost_basis` gain is computable is the
+                                // consumer's policy, not the booking engine's.
+                                let Some(cost) = &m.cost else { continue };
+                                let lot_units = m.units.number.abs();
+                                // The lot's cost value (in the cost currency).
+                                let lot_value = lot_units * cost.number;
+                                // The reduction's sale value (in the sale-price currency).
+                                // A `Unit` (`@`) price is exact per unit. A `Total` (`@@`)
+                                // price is the EXACT pro-rata share `total × units /
+                                // total_units` (multiply before divide, so a single lot and
+                                // evenly-dividing splits are exact). It is deliberately NOT
+                                // rounded here: rounding a money split to a clean per-lot
+                                // figure is a presentation concern that needs the currency's
+                                // precision (the report's `DisplayContext`), and rounding in
+                                // the booking layer to the total's own scale both distorts
+                                // round-dollar totals and can drive the last lot negative.
+                                // The exact fractions match Python beancount.
+                                let sale_value = match price.kind {
+                                    rustledger_core::PriceKind::Unit => amt.number * lot_units,
+                                    rustledger_core::PriceKind::Total if !total_units.is_zero() => {
+                                        amt.number * lot_units / total_units
                                     }
-                                    rustledger_core::PriceKind::Total => amt.number,
+                                    rustledger_core::PriceKind::Total => Decimal::ZERO,
                                 };
-
-                                let gain_amount = sale_price - cost_basis.number;
-                                if !gain_amount.is_zero() {
-                                    gains.push(CapitalGain {
-                                        account: posting.account.clone(),
-                                        currency: units.currency.clone(),
-                                        amount: Amount::new(gain_amount, &cost_basis.currency),
-                                        cost_basis: cost_basis.clone(),
-                                        proceeds: Amount::new(sale_price, &cost_basis.currency),
-                                    });
-                                }
+                                // Closing a SHORT (matched lot has negative units) inverts
+                                // the roles: the lot's cost is the price the units were SOLD
+                                // at when the short was opened (the proceeds), and the
+                                // reduction's price is what is PAID to cover (the basis) —
+                                // and the currencies follow suit.
+                                let short_sale = m.units.number.is_sign_negative();
+                                let (proceeds, cost_basis) = if short_sale {
+                                    (
+                                        Amount::new(lot_value, &cost.currency),
+                                        Amount::new(sale_value, &amt.currency),
+                                    )
+                                } else {
+                                    (
+                                        Amount::new(sale_value, &amt.currency),
+                                        Amount::new(lot_value, &cost.currency),
+                                    )
+                                };
+                                gains.push(CapitalGain {
+                                    account: posting.account.clone(),
+                                    currency: units.currency.clone(),
+                                    units: lot_units,
+                                    cost_basis,
+                                    proceeds,
+                                    sale_date: txn.date,
+                                    acquired_date: cost.date,
+                                    short_sale,
+                                });
                             }
                         }
                     }
@@ -601,29 +672,46 @@ impl BookingEngine {
 
     /// Book and interpolate a transaction.
     ///
-    /// This fills in empty cost specs, then interpolates any missing amounts.
+    /// This fills in empty cost specs, then interpolates any missing amounts. Thin
+    /// wrapper over [`Self::book_and_interpolate_with_gains`] that discards the
+    /// realized gains — a single implementation so the two cannot drift.
     pub fn book_and_interpolate(
         &self,
         txn: &Transaction,
     ) -> Result<InterpolationResult, BookingError> {
+        Ok(self.book_and_interpolate_with_gains(txn)?.0)
+    }
+
+    /// Book and interpolate a transaction, also returning the per-lot
+    /// [`CapitalGain`]s `book` computed for it.
+    ///
+    /// The loader's booking pass uses this so realized gains are captured **once**,
+    /// during canonical booking (in booking order, with the ledger's own method,
+    /// before `@@` normalization), and exposed on the `Ledger` — rather than each
+    /// consumer re-booking the stream and re-deriving them.
+    ///
+    /// # Errors
+    /// Returns a [`BookingError`] if the transaction cannot be booked (e.g. an
+    /// ambiguous or unmatched cost reduction) or interpolated (unresolved elided
+    /// amounts).
+    pub fn book_and_interpolate_with_gains(
+        &self,
+        txn: &Transaction,
+    ) -> Result<(InterpolationResult, Vec<CapitalGain>), BookingError> {
         // Fast path: with no cost specs, `book` is an identity that only clones
         // `txn` verbatim (profiling flagged that clone as ~6 MB / 10k txns — the
-        // common case). This method consumes only `booked.transaction` — the
-        // `gains` / `booked_indices` are unused here — and in the fast path that
-        // transaction *equals* `txn`, so `interpolate(&book(txn).transaction)`
-        // is provably identical to `interpolate(txn)`. Interpolate the original
-        // directly and skip the clone.
+        // common case), and it realizes no gains. In the fast path `book(txn)`'s
+        // transaction *equals* `txn`, so `interpolate(&book(txn).transaction)` is
+        // provably identical to `interpolate(txn)`. Interpolate the original
+        // directly, skip the clone, and return no gains (an empty `Vec` does not
+        // allocate).
         if !txn.postings.iter().any(|p| p.cost.is_some()) {
-            return Ok(interpolate(txn)?);
+            return Ok((interpolate(txn)?, Vec::new()));
         }
-
-        // First book (fill in costs)
+        // First book (fill in costs + compute gains), then interpolate amounts.
         let booked = self.book(txn)?;
-
-        // Then interpolate (fill in missing amounts)
         let result = interpolate(&booked.transaction)?;
-
-        Ok(result)
+        Ok((result, booked.gains))
     }
 }
 
@@ -878,7 +966,7 @@ mod tests {
         );
         let gain = &booked.gains[0];
         // Gain = 5 * (175 - 150) = 125
-        assert_eq!(gain.amount.number, dec!(125));
+        assert_eq!((gain.proceeds.number - gain.cost_basis.number), dec!(125));
     }
 
     #[test]
@@ -974,7 +1062,10 @@ mod tests {
         let gain = &booked_sell.gains[0];
         // The gain should be close to 36.73 (sale proceeds - cost basis)
         // Sale: 1.763 * 191 = 336.733, Cost: 300.00, Gain ≈ 36.73
-        eprintln!("Capital gain: {:?}", gain.amount);
+        eprintln!(
+            "Capital gain: {:?}",
+            gain.proceeds.number - gain.cost_basis.number
+        );
     }
 
     #[test]
@@ -1071,7 +1162,7 @@ mod tests {
         // Gain = 875 - (5 * 150) = 875 - 750 = 125
         assert_eq!(booked.gains.len(), 1, "Expected 1 gain");
         let gain = &booked.gains[0];
-        assert_eq!(gain.amount.number, dec!(125));
+        assert_eq!((gain.proceeds.number - gain.cost_basis.number), dec!(125));
     }
 
     #[test]
@@ -1272,8 +1363,381 @@ mod tests {
 
         let booked = engine.book(&sell).unwrap();
 
-        // Zero gain should not be added to gains vector
-        assert!(booked.gains.is_empty(), "Zero gain should not be recorded");
+        // A break-even sale is still a reportable disposal (a Form 8949 line), so it
+        // IS recorded — with a zero gain, the lot's units/basis/proceeds, and the
+        // acquisition date. (`CapitalGain` records disposals, not only non-zero
+        // gains; this is the shape the capital-gains report consumes.)
+        assert_eq!(booked.gains.len(), 1, "the disposal is recorded");
+        let g = &booked.gains[0];
+        assert_eq!(
+            (g.proceeds.number - g.cost_basis.number),
+            dec!(0),
+            "zero gain"
+        );
+        assert_eq!(g.units, dec!(5));
+        assert_eq!(g.cost_basis.number, dec!(750.00));
+        assert_eq!(g.proceeds.number, dec!(750.00));
+        assert_eq!(g.acquired_date, Some(date(2024, 1, 15)));
+    }
+
+    /// A sale crossing MULTIPLE lots yields one `CapitalGain` per matched lot, each
+    /// with its own acquisition date, cost basis, and pro-rated proceeds (Form 8949
+    /// shape). Previously a multi-lot reduction recorded no gains at all.
+    #[test]
+    fn test_book_gain_across_multiple_lots() {
+        let mut engine = BookingEngine::new(); // FIFO
+        let lot = |d, n, cost| {
+            Transaction::new(d, "buy")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(n, "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: cost })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(-n * cost, "USD"),
+                ))
+        };
+        engine.apply(&lot(date(2020, 1, 1), dec!(5), dec!(100)));
+        engine.apply(&lot(date(2020, 6, 1), dec!(5), dec!(120)));
+
+        // Sell 8 @ 150: FIFO takes 5 from lot 1 (@100) then 3 from lot 2 (@120).
+        let sell = Transaction::new(date(2021, 1, 1), "sell")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(-8), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::unit(Amount::new(dec!(150), "USD"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(1200), "USD")));
+        let g = engine.book(&sell).unwrap().gains;
+
+        assert_eq!(g.len(), 2, "one disposal per matched lot");
+        // Lot 1: 5 units, acquired 2020-01-01, basis 500, proceeds 750, gain 250.
+        assert_eq!(g[0].units, dec!(5));
+        assert_eq!(g[0].acquired_date, Some(date(2020, 1, 1)));
+        assert_eq!(g[0].cost_basis.number, dec!(500));
+        assert_eq!(g[0].proceeds.number, dec!(750));
+        assert_eq!((g[0].proceeds.number - g[0].cost_basis.number), dec!(250));
+        // Lot 2: 3 units, acquired 2020-06-01, basis 360, proceeds 450, gain 90.
+        assert_eq!(g[1].units, dec!(3));
+        assert_eq!(g[1].acquired_date, Some(date(2020, 6, 1)));
+        assert_eq!(g[1].cost_basis.number, dec!(360));
+        assert_eq!(g[1].proceeds.number, dec!(450));
+        assert_eq!((g[1].proceeds.number - g[1].cost_basis.number), dec!(90));
+    }
+
+    /// A single-lot `@@` (total) sale records the stated total as proceeds
+    /// EXACTLY, with no `total / units × units` division tail — even when the
+    /// total does not divide evenly by the units.
+    #[test]
+    fn test_book_total_price_single_lot_exact() {
+        let mut engine = BookingEngine::new();
+        // Buy 3 AAPL at $30 (basis 90).
+        engine.apply(
+            &Transaction::new(date(2024, 1, 1), "buy")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(dec!(3), "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: dec!(30) })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(dec!(-90), "USD"),
+                )),
+        );
+        // Sell all 3 for a TOTAL of $100 (100 / 3 does not terminate).
+        let sell = Transaction::new(date(2024, 6, 1), "sell")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(-3), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::total(Amount::new(dec!(100), "USD"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(100), "USD")));
+        let g = engine.book(&sell).unwrap().gains;
+        assert_eq!(g.len(), 1);
+        // Exact — NOT 99.9999…28dp — because the last (only) lot takes the remainder.
+        assert_eq!(g[0].proceeds.number, dec!(100));
+        assert_eq!(g[0].cost_basis.number, dec!(90));
+        assert_eq!((g[0].proceeds.number - g[0].cost_basis.number), dec!(10));
+    }
+
+    /// A multi-lot `@@` (total) sale pro-rates the stated total across lots so the
+    /// per-lot proceeds sum EXACTLY to the total (no over- or under-counting).
+    #[test]
+    fn test_book_total_price_multi_lot_sums_to_total() {
+        let mut engine = BookingEngine::new(); // FIFO
+        let lot = |d, n, cost| {
+            Transaction::new(d, "buy")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(n, "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: cost })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(-n * cost, "USD"),
+                ))
+        };
+        engine.apply(&lot(date(2020, 1, 1), dec!(5), dec!(100)));
+        engine.apply(&lot(date(2020, 6, 1), dec!(5), dec!(120)));
+        // Sell 8 for a TOTAL of $1200: FIFO 5 from lot 1, 3 from lot 2.
+        let sell = Transaction::new(date(2021, 1, 1), "sell")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(-8), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::total(Amount::new(dec!(1200), "USD"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(1200), "USD")));
+        let g = engine.book(&sell).unwrap().gains;
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].proceeds.number, dec!(750)); // 1200 × 5/8
+        assert_eq!(g[1].proceeds.number, dec!(450)); // remainder: 1200 − 750
+        assert_eq!(
+            g[0].proceeds.number + g[1].proceeds.number,
+            dec!(1200),
+            "per-lot proceeds sum exactly to the stated total"
+        );
+    }
+
+    /// A multi-lot `@@` (total) sale whose total does NOT divide evenly gives each
+    /// lot its EXACT pro-rata share (`total × units / total_units`) — never rounded
+    /// or forced (which distorts round-dollar totals and can go negative). The
+    /// shares are exact fractions that round to the expected cents and sum to the
+    /// stated total.
+    #[test]
+    fn test_book_total_price_uneven_split_is_exact_prorata() {
+        let mut engine = BookingEngine::new(); // FIFO
+        let lot = |d, n, cost| {
+            Transaction::new(d, "buy")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(n, "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: cost })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(-n * cost, "USD"),
+                ))
+        };
+        engine.apply(&lot(date(2020, 1, 1), dec!(1), dec!(10)));
+        engine.apply(&lot(date(2020, 6, 1), dec!(2), dec!(10)));
+        // Sell 3 for a round-dollar TOTAL of 100 (scale 0): FIFO 1 + 2. 100/3 does
+        // not terminate — the shares must NOT be rounded to whole dollars.
+        let sell = Transaction::new(date(2021, 1, 1), "sell")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(-3), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::total(Amount::new(dec!(100), "USD"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(100), "USD")));
+        let g = engine.book(&sell).unwrap().gains;
+        assert_eq!(g.len(), 2);
+        // Exact pro-rata: 100 × 1/3 and 100 × 2/3 (NOT 33 and 67 whole-dollar).
+        assert_eq!(g[0].proceeds.number, dec!(100) * dec!(1) / dec!(3));
+        assert_eq!(g[1].proceeds.number, dec!(100) * dec!(2) / dec!(3));
+        // Positive (never a negative last-lot remainder), rounding to the true cents.
+        assert!(g[0].proceeds.number > dec!(0) && g[1].proceeds.number > dec!(0));
+        assert_eq!(g[0].proceeds.number.round_dp(2), dec!(33.33));
+        assert_eq!(g[1].proceeds.number.round_dp(2), dec!(66.67));
+        assert_eq!(
+            (g[0].proceeds.number + g[1].proceeds.number).round_dp(2),
+            dec!(100.00),
+            "shares sum to the stated total at cent precision"
+        );
+    }
+
+    /// A coarse-scale `@@` total split across MANY lots never produces a negative
+    /// per-lot proceeds (the old round-to-scale-plus-remainder scheme could:
+    /// `@@ 2 USD` over four lots rounded the first three UP past the total, driving
+    /// the last lot negative). Exact pro-rata keeps every lot positive.
+    #[test]
+    fn test_book_total_price_coarse_scale_never_negative() {
+        let mut engine = BookingEngine::new(); // FIFO
+        let lot = |d, n: Decimal| {
+            Transaction::new(d, "buy")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(n, "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: dec!(1) })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(-n, "USD")))
+        };
+        engine.apply(&lot(date(2020, 1, 1), dec!(3)));
+        engine.apply(&lot(date(2020, 2, 1), dec!(3)));
+        engine.apply(&lot(date(2020, 3, 1), dec!(3)));
+        engine.apply(&lot(date(2020, 4, 1), dec!(1)));
+        // Sell all 10 for a round-dollar total of 2 (scale 0), FIFO 3+3+3+1.
+        let sell = Transaction::new(date(2021, 1, 1), "sell")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(-10), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::total(Amount::new(dec!(2), "USD"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(2), "USD")));
+        let g = engine.book(&sell).unwrap().gains;
+        assert_eq!(g.len(), 4);
+        assert!(
+            g.iter().all(|x| x.proceeds.number >= dec!(0)),
+            "no lot has negative proceeds: {:?}",
+            g.iter().map(|x| x.proceeds.number).collect::<Vec<_>>()
+        );
+        let total: Decimal = g.iter().map(|x| x.proceeds.number).sum();
+        assert_eq!(total.round_dp(2), dec!(2.00), "shares sum to the total");
+    }
+
+    /// A disposal whose sale-price currency differs from the lot's cost currency is
+    /// RECORDED with proceeds in the sale currency and basis in the cost currency
+    /// (the booking engine does not decide whether a cross-currency gain is
+    /// computable — that policy is the consumer's; the report filters such rows).
+    #[test]
+    fn test_book_cross_currency_disposal_records_both_currencies() {
+        let mut engine = BookingEngine::new();
+        // Buy 3 AAPL at cost 30 USD.
+        engine.apply(
+            &Transaction::new(date(2024, 1, 1), "buy")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(dec!(3), "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: dec!(30) })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(dec!(-90), "USD"),
+                )),
+        );
+        // Sell priced in EUR.
+        let sell = Transaction::new(date(2024, 6, 1), "sell")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(-3), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::unit(Amount::new(dec!(50), "EUR"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(150), "EUR")));
+        let g = engine.book(&sell).unwrap().gains;
+        assert_eq!(g.len(), 1);
+        // Proceeds in the sale currency (EUR), basis in the cost currency (USD).
+        assert_eq!(g[0].proceeds.number, dec!(150));
+        assert_eq!(g[0].proceeds.currency.as_ref(), "EUR");
+        assert_eq!(g[0].cost_basis.number, dec!(90));
+        assert_eq!(g[0].cost_basis.currency.as_ref(), "USD");
+    }
+
+    /// A sale that FIFO-matches lots held in DIFFERENT cost currencies records the
+    /// same-currency lot AND the cross-currency lot — both are recorded, each with
+    /// its own proceeds/basis currencies (the report, not the booking engine,
+    /// decides a cross-currency row's gain is not computable).
+    #[test]
+    fn test_book_mixed_currency_lots_records_both() {
+        let mut engine = BookingEngine::new(); // FIFO
+        // Lot 1: 5 AAPL at 100 USD (2020). Lot 2: 5 AAPL at 90 EUR (2021).
+        engine.apply(
+            &Transaction::new(date(2020, 1, 1), "buy usd")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(dec!(5), "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: dec!(100) })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(dec!(-500), "USD"),
+                )),
+        );
+        engine.apply(
+            &Transaction::new(date(2021, 1, 1), "buy eur")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(dec!(5), "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: dec!(90) })
+                            .with_currency("EUR"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(dec!(-450), "EUR"),
+                )),
+        );
+        // Sell 8 @ 150 USD: FIFO takes 5 from the USD lot, 3 from the EUR lot.
+        let sell = Transaction::new(date(2023, 1, 1), "sell")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(-8), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::unit(Amount::new(dec!(150), "USD"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(1200), "USD")));
+        let g = engine.book(&sell).unwrap().gains;
+        assert_eq!(g.len(), 2, "both lots recorded: {g:?}");
+        // USD lot: same-currency, computable gain 250.
+        assert_eq!(g[0].units, dec!(5));
+        assert_eq!(g[0].cost_basis.number, dec!(500));
+        assert_eq!(g[0].cost_basis.currency.as_ref(), "USD");
+        assert_eq!(g[0].proceeds.number, dec!(750));
+        assert_eq!(g[0].proceeds.currency.as_ref(), "USD");
+        // EUR lot: cross-currency — proceeds in USD (the sale price), basis in EUR.
+        assert_eq!(g[1].units, dec!(3));
+        assert_eq!(g[1].proceeds.number, dec!(450));
+        assert_eq!(g[1].proceeds.currency.as_ref(), "USD");
+        assert_eq!(g[1].cost_basis.number, dec!(270));
+        assert_eq!(g[1].cost_basis.currency.as_ref(), "EUR");
+    }
+
+    /// Closing a SHORT position: the gain sign and proceeds/basis are the mirror of
+    /// a long disposal — you profit when you cover BELOW the price you shorted at.
+    /// Sold 5 @ 100 (received 500), cover 5 @ 80 (paid 400) => +100 gain.
+    #[test]
+    fn test_book_short_cover_gain_sign_and_flag() {
+        let mut engine = BookingEngine::new();
+        // Open the short: sell 5 not held, at cost 100 (the price shorted at).
+        engine.apply(
+            &Transaction::new(date(2020, 1, 1), "open short")
+                .with_synthesized_posting(
+                    Posting::new("Assets:Stock", Amount::new(dec!(-5), "AAPL")).with_cost(
+                        CostSpec::empty()
+                            .with_number(rustledger_core::CostNumber::PerUnit { value: dec!(100) })
+                            .with_currency("USD"),
+                    ),
+                )
+                .with_synthesized_posting(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(dec!(500), "USD"),
+                )),
+        );
+        // Cover: buy 5 back at 80.
+        let cover = Transaction::new(date(2020, 6, 1), "cover")
+            .with_synthesized_posting(
+                Posting::new("Assets:Stock", Amount::new(dec!(5), "AAPL"))
+                    .with_cost(CostSpec::empty())
+                    .with_price(PriceAnnotation::unit(Amount::new(dec!(80), "USD"))),
+            )
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(dec!(-400), "USD")));
+        let g = engine.book(&cover).unwrap().gains;
+        assert_eq!(g.len(), 1);
+        assert!(g[0].short_sale, "closing a short is flagged");
+        assert_eq!(
+            g[0].proceeds.number,
+            dec!(500),
+            "short-open value is the proceeds"
+        );
+        assert_eq!(g[0].cost_basis.number, dec!(400), "cover cost is the basis");
+        assert_eq!(
+            (g[0].proceeds.number - g[0].cost_basis.number),
+            dec!(100),
+            "gain = proceeds - basis = +100"
+        );
+        assert_eq!(g[0].acquired_date, Some(date(2020, 1, 1)));
     }
 
     /// Test cost currency inference from other postings (issue #230).

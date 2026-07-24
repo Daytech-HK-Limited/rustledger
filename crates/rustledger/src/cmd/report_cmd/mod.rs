@@ -25,6 +25,7 @@
 mod accounts;
 mod balances;
 mod balsheet;
+mod capgains;
 mod commodities;
 mod holdings;
 mod income;
@@ -185,6 +186,25 @@ pub enum Report {
         #[arg(long)]
         by_group: bool,
     },
+    /// Realized capital gains/losses per tax lot (short vs long term)
+    Capgains {
+        /// Filter to disposals from accounts under this prefix (default: all).
+        #[arg(short, long)]
+        account: Option<String>,
+        /// Only disposals in this calendar/tax year (`YYYY`).
+        #[arg(short, long)]
+        year: Option<i32>,
+        /// Exclude disposals after this date (`YYYY-MM-DD`).
+        #[arg(short, long)]
+        end: Option<String>,
+        /// Override the long-term threshold with a fixed day count: a lot held
+        /// strictly more than this many days is long-term. The default (unset)
+        /// uses the calendar rule — long-term when the sale is more than one year
+        /// after acquisition — which is leap-year correct (the US "> 1 year" rule),
+        /// unlike any fixed day count.
+        #[arg(long)]
+        long_term_days: Option<i64>,
+    },
 }
 
 /// Run the report command with the given arguments.
@@ -269,6 +289,9 @@ struct LoadedReport {
     /// Source-faithful directive stream (pads remain `Pad`). Used by
     /// reports that count/list source directive kinds.
     directives: Vec<rustledger_core::Directive>,
+    /// Realized capital gains captured by the loader's canonical booking pass,
+    /// consumed by the capgains report. Empty for every other report.
+    capital_gains: Vec<rustledger_booking::CapitalGain>,
     /// Config-aware account-type classifier (honors `name_*` renames).
     /// Reports must route/sign accounts through this, never by hardcoded
     /// root-prefix matching — renamed ledgers otherwise misroute (L5:
@@ -307,6 +330,9 @@ fn load(file: &PathBuf, report: &Report, verbose: bool, no_cache: bool) -> Resul
     // would double up on a miss and mislead on a cache hit.
     let options = LoadOptions {
         validate: false, // Reports don't need validation
+        // Only the capgains report reads `Ledger::capital_gains`; opt in so no other
+        // report pays to retain the vector.
+        collect_capital_gains: matches!(report, Report::Capgains { .. }),
         ..Default::default()
     };
 
@@ -371,10 +397,12 @@ fn load(file: &PathBuf, report: &Report, verbose: bool, no_cache: bool) -> Resul
     let account_types = ledger.options.to_account_types();
     let display_context = ledger.display_context.clone();
     let operating_currency = ledger.options.operating_currency.clone();
+    let capital_gains = ledger.capital_gains;
     let directives: Vec<_> = ledger.directives.into_iter().map(|s| s.value).collect();
 
     Ok(LoadedReport {
         directives,
+        capital_gains,
         account_types,
         balance_view,
         display_context,
@@ -509,6 +537,38 @@ fn render<W: io::Write>(
                     if total == 1 { "scope" } else { "scopes" },
                 );
             }
+        }
+        Report::Capgains {
+            account,
+            year,
+            end,
+            long_term_days,
+        } => {
+            if let Some(n) = long_term_days
+                && *n < 0
+            {
+                anyhow::bail!("--long-term-days must be non-negative (got {n})");
+            }
+            let end_date: Option<NaiveDate> = end
+                .as_deref()
+                .map(|s| {
+                    s.parse()
+                        .with_context(|| format!("invalid --end date {s:?} (expected YYYY-MM-DD)"))
+                })
+                .transpose()?;
+            let filter = capgains::CapgainsFilter {
+                account: account.as_deref(),
+                year: *year,
+                end: end_date,
+            };
+            capgains::report_capgains(
+                &loaded.capital_gains,
+                &filter,
+                *long_term_days,
+                &loaded.display_context,
+                format,
+                writer,
+            )?;
         }
     }
 
