@@ -44,7 +44,7 @@
 //! (beangrow, fava-portfolio-summary) uses declared groups that bundle their
 //! income accounts.
 
-use super::{OutputFormat, csv_escape, json_escape};
+use super::{OutputFormat, csv_escape, json_escape, sanitize_display};
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use rustledger_core::{Directive, DisplayContext, MetaValue, NaiveDate, is_subaccount_or_equal};
@@ -238,25 +238,6 @@ fn build_groups(
     rows
 }
 
-/// Replace control characters and the Unicode line/paragraph separators
-/// (U+2028/U+2029) with a space. A `returns-group:` label is arbitrary
-/// user-controlled text; on the human-facing surfaces (the text table, CSV, and
-/// stderr warnings) such bytes could inject terminal escapes or extra lines, so
-/// they are neutralized. The JSON path does not use this — it keeps the label
-/// intact and valid via `escape_json` (C0 control bytes become `\uXXXX`;
-/// U+2028/U+2029 stay as-is, which is already valid inside a JSON string).
-fn sanitize_display(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
 /// The first shared in-scope account for EACH group in `rows`, computed in ONE
 /// pass over the transactions instead of re-walking the directive stream once per
 /// group. Entry `i` is `Some(account)` when some transaction touching `rows[i]`
@@ -413,6 +394,7 @@ pub(super) fn report_returns<W: Write>(
     ctx: &DisplayContext,
     format: &OutputFormat,
     writer: &mut W,
+    warnings: &mut dyn super::Diagnostics,
 ) -> Result<ReturnsOutcome> {
     // Reporting currency: --currency, else the ledger's first operating currency,
     // else an actionable error (the return is single-currency by construction).
@@ -449,15 +431,16 @@ pub(super) fn report_returns<W: Write>(
     // Grouping is opt-in; warnings (bad tags, overlaps, non-self-contained
     // groups) go to stderr so they never pollute the report on stdout.
     let group_scopes = build_groups(directives, &whole_scope, end_date, &mut |w| {
-        eprintln!("warning: {w}");
+        warnings.emit(super::Diagnostic::message(w));
     });
     if group_scopes.is_empty() {
         // Still emit the grouped shape (an empty `groups` list plus the TOTAL):
         // `--by-group` must produce one stable schema regardless of ledger
         // content, so a JSON/CSV consumer never has to branch on it.
-        eprintln!(
-            "warning: --by-group but no in-scope `returns-group:` metadata found; reporting only the whole-portfolio total"
-        );
+        warnings.emit(super::Diagnostic::message(
+            "--by-group but no in-scope `returns-group:` metadata found; reporting \
+             only the whole-portfolio total",
+        ));
         // No groups to partially render, so an unvaluable TOTAL still fails loudly
         // (via `?`), matching the all-unvaluable rule below.
         let total = compute_group(
@@ -516,10 +499,10 @@ pub(super) fn report_returns<W: Write>(
                 // lines (same guard the grouping warnings use). The error text is
                 // grammar-constrained (account names / currencies), so it needs no
                 // sanitizing.
-                eprintln!(
-                    "warning: returns for {} are unavailable: {e}",
+                warnings.emit(super::Diagnostic::message(format!(
+                    "returns for {} are unavailable: {e}",
                     sanitize_display(&label)
-                );
+                )));
                 rows.push(GroupRow::Unvaluable {
                     label,
                     reason: e.to_string(),
@@ -829,25 +812,11 @@ fn render_grouped<W: Write>(
 
 /// Truncate a label to fit a text column (keeps the informative tail).
 ///
-/// The label is first run through `sanitize_display` (control chars → space),
-/// so it can neither split the fixed-width row across lines nor inject a spoofed
-/// second line into the text report.
+/// Delegates to the shared [`super::truncate_label`], which sanitizes control
+/// characters so a label can neither split the fixed-width row across lines nor
+/// inject a spoofed second line into the text report.
 fn truncate(s: &str, width: usize) -> String {
-    let s = sanitize_display(s);
-    let s = s.as_str();
-    if s.chars().count() <= width {
-        s.to_string()
-    } else {
-        let tail: String = s
-            .chars()
-            .rev()
-            .take(width - 1)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        format!("…{tail}")
-    }
+    super::truncate_label(s, width)
 }
 
 #[cfg(test)]
@@ -1223,6 +1192,7 @@ mod tests {
             &ctx,
             &OutputFormat::Text,
             &mut out,
+            &mut crate::cmd::report_cmd::CollectedDiagnostics::default(),
         );
         // The report is written AND the outcome reports it is partial (2 of 3
         // scopes unvaluable: Broken and TOTAL). The non-zero exit is the CLI

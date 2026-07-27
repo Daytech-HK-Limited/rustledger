@@ -30,47 +30,31 @@ use crate::error::QueryError;
 /// Compute a posting's `weight` — the cost-converted amount used for
 /// transaction balancing.
 ///
-/// The arithmetic delegates to the booking crate's single-source weight
-/// ladder ([`rustledger_booking::cost_number_weight`] /
-/// [`rustledger_booking::price_weight`]) — the exact rule the balance
-/// validator's residual uses — so the `weight` column cannot drift from
-/// `rledger check`. Notably `{{total}}`/`PerUnitFromTotal` specs take the
-/// preserved total (sign following units) rather than recomputing
-/// `units × per_unit`, which for a non-terminating per-unit division would
-/// be off in the last of `rust_decimal`'s 28 digits (#1106/#1113), and
-/// `@@` credit-side postings flip sign (issue #1052).
+/// Both the arithmetic and the cost-beats-price ladder come from
+/// [`rustledger_booking::posting_weight`], shared with the budget report's
+/// actual-spend accrual, so those two cannot drift from each other.
 ///
-/// Fallback order (matching Beancount, cost beats price):
-/// - Cost spec with a number and an explicit currency: cost weight.
-/// - Else a complete price annotation: price weight.
-/// - Else: `units` as-is.
+/// It is NOT the balance validator's rule and must not be described as one.
+/// `posting_weight`'s own docs spell out where it diverges from
+/// `calculate_residual`'s `residual_weight` (a cost number carrying no
+/// currency, and a bare `{}` refusing to fall through to a price). Claiming
+/// the two cannot drift would send someone chasing a `weight`-vs-`rledger
+/// check` disagreement into "aligning" the residual — which is issue #1026
+/// re-introduced, flipping E3001 for every ledger holding a bare-cost-plus-
+/// price posting. `currency_accounts` re-derives the ladder on the DTO types
+/// and differs deliberately as well; see its own comments.
+/// Notably `{{total}}`/`PerUnitFromTotal` specs take the preserved total
+/// (sign following units) rather than recomputing `units × per_unit`, which
+/// for a non-terminating per-unit division would be off in the last of
+/// `rust_decimal`'s 28 digits (#1106/#1113), and `@@` credit-side postings
+/// flip sign (issue #1052).
 ///
 /// Returns `Value::Null` for postings without resolved units. Used by
 /// both [`Executor::build_postings_table`] (the `#postings` table
 /// builder) and [`Executor::evaluate_column`] (the default-FROM column
 /// accessor) so the two paths can't drift again.
 pub(super) fn compute_posting_weight(posting: &rustledger_core::Posting) -> Value {
-    let Some(units) = posting.amount() else {
-        return Value::Null;
-    };
-    if let Some(cost_spec) = &posting.cost
-        && let Some(number) = &cost_spec.number
-        && let Some(currency) = cost_spec.currency.clone()
-    {
-        return Value::Amount(Amount::new(
-            rustledger_booking::cost_number_weight(units.number, number),
-            currency,
-        ));
-    }
-    if let Some(price_ann) = &posting.price
-        && let Some(price_amt) = price_ann.amount()
-    {
-        return Value::Amount(Amount::new(
-            rustledger_booking::price_weight(units.number, price_amt.number, price_ann.kind),
-            price_amt.currency.clone(),
-        ));
-    }
-    Value::Amount(units.clone())
+    rustledger_booking::posting_weight(posting).map_or(Value::Null, Value::Amount)
 }
 
 /// Query executor.
@@ -1384,10 +1368,16 @@ impl<'a> Executor<'a> {
                 Self::require_args_count(&name_upper, args, 1)?;
                 match &args[0] {
                     // beanquery returns a `YYYY-Qn` string, not an integer.
+                    // Through the canonical, like `DATE_TRUNC('QUARTER', …)`
+                    // and `DATE_PART('QUARTER', …)`. This was the last inline
+                    // copy of the formula: a configurable fiscal-year quarter
+                    // offset would have moved those two and left this one
+                    // labeling each bucket a quarter off from the rows beside
+                    // it, with no test failing.
                     Value::Date(d) => Ok(Value::String(format!(
                         "{:04}-Q{}",
                         d.year(),
-                        (d.month() - 1) / 3 + 1
+                        rustledger_core::quarter_index0(u32::from(d.month().unsigned_abs())) + 1
                     ))),
                     Value::Null => Ok(Value::Null),
                     _ => Err(QueryError::Type("QUARTER expects a date".to_string())),

@@ -214,18 +214,14 @@ impl Executor<'_> {
         };
 
         let result = match field.as_str() {
-            "YEAR" => rustledger_core::naive_date(i32::from(date.year()), 1, 1),
-            "QUARTER" => {
-                let quarter = quarter_index0(date.month() as u32);
-                rustledger_core::naive_date(i32::from(date.year()), quarter * 3 + 1, 1)
-            }
-            "MONTH" => rustledger_core::naive_date(i32::from(date.year()), date.month() as u32, 1),
-            "WEEK" => {
-                // Start of week (Monday)
-                let days_from_monday = i64::from(date.weekday().to_monday_zero_offset() as u32);
-                date.checked_add(jiff::ToSpan::days(-days_from_monday)).ok()
-            }
-            "DAY" => Some(date),
+            // Truncation delegates to the shared canonical
+            // (`rustledger_core::CalendarPeriod`) so BQL period grouping and the
+            // budget report's interval accrual cannot drift apart.
+            "YEAR" => Some(rustledger_core::CalendarPeriod::Year.start_of(date)),
+            "QUARTER" => Some(rustledger_core::CalendarPeriod::Quarter.start_of(date)),
+            "MONTH" => Some(rustledger_core::CalendarPeriod::Month.start_of(date)),
+            "WEEK" => Some(rustledger_core::CalendarPeriod::Week.start_of(date)),
+            "DAY" => Some(rustledger_core::CalendarPeriod::Day.start_of(date)),
             _ => {
                 return Err(QueryError::Type(format!(
                     "DATE_TRUNC: unknown field '{field}', expected YEAR, QUARTER, MONTH, WEEK, or DAY"
@@ -263,7 +259,7 @@ impl Executor<'_> {
             "YEAR" => i64::from(date.year()),
             "MONTH" => i64::from(date.month()),
             "DAY" => i64::from(date.day()),
-            "QUARTER" => i64::from(quarter_index0(date.month() as u32) + 1),
+            "QUARTER" => i64::from(rustledger_core::quarter_index0(date.month() as u32) + 1),
             "WEEK" => {
                 // ISO week number via strftime %V
                 let week_str = jiff::fmt::strtime::format("%V", date).unwrap_or_default();
@@ -453,21 +449,6 @@ impl Executor<'_> {
 
         Ok(Value::Date(binned))
     }
-}
-
-/// Zero-based quarter index for a 1-based month (0 => Q1). The single
-/// `(month - 1) / 3` formula for this module — `DATE_TRUNC` and
-/// `QUARTER()` both derive from it rather than re-deriving it inline
-/// (the sweep found it written twice, diverging only in off-by-one
-/// framing). `DATE_BIN`'s quarter arm is NOT a user of this formula:
-/// it buckets by months-elapsed-since-origin (`months_diff / (3 * amt)`),
-/// which is origin- and width-relative, not calendar-quarter indexing.
-///
-/// `month1` must be 1-based (`Zoned`/`Date::month()` guarantees 1..=12);
-/// 0 would wrap in release builds, so debug builds assert.
-const fn quarter_index0(month1: u32) -> u32 {
-    debug_assert!(month1 >= 1);
-    (month1 - 1) / 3
 }
 
 /// Add `days` to `date`, returning a graceful error instead of panicking when

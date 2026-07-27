@@ -25,6 +25,7 @@ A report subcommand (e.g. `balances`, `journal`) is required — running `rledge
 | `holdings` | | Investment holdings with cost basis |
 | `returns` | | Investment returns — money-weighted (XIRR) and time-weighted |
 | `capgains` | | Realized capital gains/losses per tax lot (short vs long term) |
+| `budget` | | Budgeted vs actual spending, from Fava-compatible `custom "budget"` directives |
 | `networth` | | Net worth over time |
 | `accounts` | | List all accounts |
 | `commodities` | | List all currencies/commodities |
@@ -427,6 +428,145 @@ Not a tax filing: wash-sale adjustments, separating currency gains from asset
 gains, lots seeded by `pad` (no well-defined cost basis), and jurisdiction rules
 beyond the long-term threshold are out of scope. Gains are reported in each lot's
 **cost currency**, summarized per currency for a multi-currency ledger.
+
+### Budget
+
+`budget` reports budgeted versus actual spending. Budgets are declared with
+**Fava's `custom "budget"` directive** — plain, unextended Beancount syntax, so a
+ledger already budgeted for Fava works here unchanged and the ledger stays the only
+source of truth:
+
+```beancount
+2024-01-01 custom "budget" Expenses:Food      "monthly" 400.00 USD
+2024-01-01 custom "budget" Expenses:Transport "weekly"   70.00 USD
+2024-06-01 custom "budget" Expenses:Food      "monthly" 450.00 USD   ; supersedes from June
+```
+
+```bash
+rledger report ledger.beancount budget --from 2024-02-01 --to 2024-03-01
+```
+
+```text
+Budget
+====================================================================================
+
+Period      2024-02-01 to 2024-03-01 (end exclusive)
+
+Account                      Ccy       Budgeted       Actual    Remaining     Used
+------------------------------------------------------------------------------------
+Expenses:Food                USD         400.00       120.00       280.00    30.0%
+Expenses:Transport           USD         290.00        60.00       230.00    20.7%
+------------------------------------------------------------------------------------
+TOTAL                        USD         690.00       180.00       510.00    26.1%
+```
+
+Totals are per currency (summing across currencies would be meaningless), and each
+budget and each posting is counted once — under `--children` a parent row and a child
+row overlap by design, so the TOTAL is *not* the sum of the rows. `--format csv` and
+`--format json` carry the same TOTAL rows, and JSON adds an `errors` array naming any
+directive that could not be read. A figure too large to represent is reported as absent
+rather than clamped: `n/a` in text, an empty cell in CSV, `null` in JSON (and named in
+`errors`).
+
+Each row is rounded for display independently, and the TOTAL is computed from the
+unrounded figures, so on a pro-rated window the printed rows may not add up to the
+printed TOTAL by a cent. The TOTAL is the accurate number; it is also *not* the sum of
+the rows under `--children`, where a parent row and a child row overlap by design.
+
+A currency the ledger never posts in — a budget added before any spending is recorded —
+has no display convention to infer, so a pro-rated figure for it is rounded to 8 decimal
+places rather than to the scale of the declared amount. That scale describes the
+declaration, not the pro-rated result: rounding `0.5 BTC` accrued over half a month to
+one decimal would report `0.2` for a true `0.22580645`.
+
+| Option | Description |
+|--------|-------------|
+| `--account <PREFIX>` | Only accounts starting with this prefix — the same raw prefix test `balances`, `holdings`, `journal` and `networth` use, so one value selects the same accounts everywhere. (Budget *coverage* under `--children` is matched by account component instead; see below.) |
+| `--from <YYYY-MM-DD>` | Window start, inclusive. Defaults to the start of the year being reported on (the year of `--to`), not the current year. |
+| `--to <YYYY-MM-DD>` | Window end, **exclusive**. Defaults to *tomorrow*, so the default window includes today's own spending. Because it is exclusive, `--from X --to X` is an empty window and is rejected. |
+| `--children` | Count spending in subaccounts toward a parent's budget (see below). |
+
+**Intervals** are `daily`, `weekly`, `monthly`, `quarterly` and `yearly` (the bare
+nouns `day`, `week`, `month`, `quarter`, `year` are also accepted, case-insensitively,
+matching Fava's implementation). An unrecognized interval is reported as a warning and
+that directive is skipped — it does not silently become a zero budget.
+
+**How the budget is pro-rated.** Each day in the window accrues its share of the
+budget for the calendar interval containing it, so the denominator is a real calendar
+length: a monthly budget divides by 28, 29, 30 or 31, and a yearly one by 365 or 366.
+Two consequences worth knowing:
+
+- A **whole** calendar period always accrues *exactly* the stated amount — a monthly
+  400 over February reads 400.00, in a leap year too.
+- An **arbitrary** window pro-rates automatically: the first half of February 2024 is
+  14/29 of the monthly figure, no special case needed.
+
+Intervals anchor to **calendar boundaries** (month = the 1st, quarter = Jan/Apr/Jul/Oct 1,
+year = Jan 1, week = ISO Monday), *not* to the date on the directive. A budget declared
+mid-month starts accruing that day, but each day is still divided by the surrounding
+calendar month.
+
+**Superseding.** A later directive replaces an earlier one for the same account **and
+currency**, from its own date. Budgets in different currencies for one account stay
+simultaneously active and are reported as separate rows — one rate never silently
+replaces another denominated differently. Nothing accrues before the first declaration:
+a budget is not retroactive.
+
+**Pad-synthesized postings count as spending.** A `pad`/`balance` pair that
+reconciles a budgeted account books the difference to it, and `report budget`
+counts that like any other posting — the same figure `report balances` and
+`report income` show for the same account. It can look surprising, because no
+transaction in the file corresponds to it; the plug is the ledger saying that
+money did move. If you would rather it did not count against a budget, pad to a
+dedicated adjustment account instead of a budgeted one.
+
+**Spending before the budget existed is excluded too.** Both sides of the comparison
+start on the day the budget was declared, so adding a budget in June and running the
+default year-to-date window compares June's budget against June's spending — not
+against January-to-June's. A posting carrying a price or a cost counts toward a budget
+in *either* currency it moved: `Expenses:Travel 90.00 EUR @ 1.10 USD` is 90.00 against
+a EUR budget and 99.00 against a USD one.
+
+**Parent and child accounts.** By default a budget on `Expenses:Food` covers only
+postings booked to `Expenses:Food` itself, matching Fava. Pass `--children` to also
+count subaccounts, which *sums* the parent's own budget with any child budgets (they
+add; the child is not absorbed).
+
+> **A deliberate deviation from Fava.** Fava selects children with a plain string
+> prefix test, so a budget on `Expenses:Food` also captures `Expenses:FoodCourt` — a
+> different account that merely shares a name prefix. rledger compares account
+> *components*, so only true subaccounts (`Expenses:Food:Restaurant`) match.
+
+`remaining` is `budgeted − actual`, so an overspent account goes negative rather than
+clamping at zero, and `used` is `n/a` (not 0%) when nothing was budgeted. Totals are
+per currency; summing across currencies would be meaningless. Accounts with spending
+but no budget are not listed — [`report balances`](#account-balances) already answers
+that question.
+
+This is periodic budget-vs-actual, not envelope budgeting: there is no rollover of
+unspent amounts between periods, and no allocation of income into envelopes.
+
+**Warnings.** A budget renders as a perfectly ordinary row even when it can never
+match any spending, so the report says what the figures cannot: an account that is
+never opened or already closed, a currency the account never posts in, a figure too
+large to represent, and a budget smaller than its currency's display precision (which
+would otherwise render as `0.00` with `used` `n/a` — indistinguishable from having no
+budget). Warnings are written to stderr in every format, and JSON additionally
+carries them in-band in its `errors` array, so a consumer parsing only stdout
+still sees them. `ag-rledger` puts them in its envelope as structured
+`warnings` records, since it discards the process's stderr.
+
+A `custom "budget"` directive that rledger is confident IS a budget but cannot use is
+also reported by [`rledger check`](check.md) as `E11001`. Directives whose payload is
+not recognizably a Fava budget are left alone everywhere — `custom` is beancount's
+open extension point and the name is not rledger's alone.
+
+**Empty reports.** "No budgets declared", "none were in force in this period" and
+"the `--account` filter excluded them all" are three different answers, and the report
+distinguishes them. JSON carries an `empty` object with a stable `code`
+(`none_declared`, `all_rejected`, `none_in_window`, `filtered_out`) alongside the
+prose; CSV notes it on stderr, since a comment row would break the parsers CSV exists
+for.
 
 ### Net Worth Over Time
 

@@ -436,6 +436,63 @@ pub fn price_weight(
     price_weight_generic::<Decimal>(units_number, price_number, kind)
 }
 
+/// The canonical weight of a whole posting: the amount, **in the currency the
+/// posting contributes to the transaction balance**, that this posting is worth.
+///
+/// This is the *ladder* that selects between the two weight arithmetics
+/// ([`cost_number_weight`] and [`price_weight`]), matching Beancount — cost
+/// beats price:
+///
+/// - a cost spec with both a number and an explicit currency → cost weight, in
+///   the cost currency;
+/// - else a complete price annotation → price weight, in the price currency;
+/// - else the units themselves, in the units currency.
+///
+/// `None` for a posting whose units are unresolved (elided, pre-interpolation).
+///
+/// Consumers that surface a per-posting weight — the BQL `weight` column, the
+/// budget report's actual-spend accrual — MUST call this rather than re-derive
+/// the ladder, so they cannot drift from each other.
+///
+/// # This is NOT byte-for-byte the `rledger check` rule
+///
+/// [`calculate_residual`]'s `residual_weight` is the balance validator's rule
+/// and differs in two places, both of which only matter for cost specs:
+///
+/// - a cost spec with a number but NO explicit currency: the residual infers
+///   the cost currency from the transaction's other postings
+///   (`infer_cost_currency_from_postings`); this function falls through to the
+///   price branch instead;
+/// - a bare `{}` with no determinable number: the residual contributes NOTHING
+///   and deliberately refuses to fall through to a price annotation, because
+///   the canonical weight of a cost-tracked posting is `units × cost`, not
+///   `units × price` (issue #1026); this function does fall through.
+///
+/// Aligning the two would change BQL `weight` results, so it is deliberately
+/// left alone here — but do not describe this as "the rule `check` uses".
+#[must_use]
+pub fn posting_weight(posting: &rustledger_core::Posting) -> Option<Amount> {
+    let units = posting.amount()?;
+    if let Some(cost_spec) = &posting.cost
+        && let Some(number) = &cost_spec.number
+        && let Some(currency) = cost_spec.currency.clone()
+    {
+        return Some(Amount::new(
+            cost_number_weight(units.number, number),
+            currency,
+        ));
+    }
+    if let Some(price_ann) = &posting.price
+        && let Some(price_amt) = price_ann.amount()
+    {
+        return Some(Amount::new(
+            price_weight(units.number, price_amt.number, price_ann.kind),
+            price_amt.currency.clone(),
+        ));
+    }
+    Some(units.clone())
+}
+
 /// The price-annotation weight arithmetic, generic over the numeric backend —
 /// the single implementation behind [`price_weight`] and [`residual_weight`].
 ///
@@ -463,6 +520,14 @@ fn price_weight_generic<D: WeightNum>(
 /// The canonical per-posting balance weight, summed per currency, generic over
 /// the numeric backend. Single source of truth for [`calculate_residual`] and
 /// [`calculate_residual_precise`].
+///
+/// DELIBERATELY not the same rule as [`posting_weight`], which serves BQL's
+/// `weight` column and the budget report. That one infers a cost number with no
+/// currency and refuses to let a bare `{}` fall through to a price; this one
+/// does neither, because #1026 turns on it — aligning the two flips E3001
+/// pass/fail for every ledger containing a bare-cost-plus-price posting. See
+/// `posting_weight`'s docs for the other half of this pair. Revisit only if
+/// #1026 is settled such that one rule can serve both.
 ///
 /// Weight rule (Beancount): a cost spec puts the weight in the cost currency
 /// (`cost` beats `price`); else a price annotation puts it in the price

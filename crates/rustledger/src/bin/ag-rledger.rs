@@ -19,6 +19,7 @@
 use agcli::{
     ActionParam, AgentCli, Command, CommandError, CommandOutput, ExecutionContext, NextAction,
 };
+use rustledger::cmd::report_cmd::CollectedDiagnostics;
 use rustledger::config::Config;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -193,7 +194,7 @@ fn report_command(name: &'static str, description: &'static str) -> Command {
         .usage(
             "ag-rledger report [<file>] <report> [--file <file>] [--format <format>] [--verbose] \
              [-v] [--account <account>] [--limit <n>] [--period <period>] [--currency <currency>] \
-             [--no-zero]",
+             [--no-zero] [--from <YYYY-MM-DD>] [--to <YYYY-MM-DD>] [--children]",
         )
         .allow_unknown_flags()
         .allow_extra_args()
@@ -205,9 +206,9 @@ fn report_command(name: &'static str, description: &'static str) -> Command {
             let built = build_report_args(req);
             Box::pin(async move {
                 let (file, report, verbose, format) = built?;
-                run_buffered("report", |out| {
+                run_buffered_with_warnings("report", |out, warnings| {
                     rustledger::cmd::report_cmd::run_with_writer(
-                        &file, &report, verbose, &format, out,
+                        &file, &report, verbose, &format, out, warnings,
                     )
                     .map(|()| 0)
                 })
@@ -569,7 +570,7 @@ fn build_report_args(
         CommandError::new(
             "report subcommand is required",
             "MISSING_REPORT",
-            "Use balances, income, journal, holdings, networth, accounts, commodities, stats, or prices.",
+            "Use balances, income, journal, holdings, networth, accounts, commodities, stats, prices, or budget.",
         )
         .exit_code(agcli::ExitCode::USAGE)
     })?;
@@ -616,6 +617,12 @@ fn build_report(
         Some("prices") => Ok(Report::Prices {
             commodity: string_flag(req, "commodity", Some("c")),
         }),
+        Some("budget") => Ok(Report::Budget {
+            account: string_flag(req, "account", Some("a")),
+            from: string_flag(req, "from", None),
+            to: string_flag(req, "to", None),
+            children: bool_flag(req, "children", None),
+        }),
         _ => Err(invalid_enum(
             "report",
             report_name,
@@ -630,6 +637,7 @@ fn build_report(
                 "commodities",
                 "stats",
                 "prices",
+                "budget",
             ],
         )),
     }
@@ -647,6 +655,7 @@ fn parse_report_name(name: &str) -> Option<String> {
         "commodities" => Some("commodities".to_string()),
         "stats" => Some("stats".to_string()),
         "prices" => Some("prices".to_string()),
+        "budget" => Some("budget".to_string()),
         _ => None,
     }
 }
@@ -950,10 +959,53 @@ fn run_buffered<F>(command: &str, run: F) -> Result<CommandOutput, CommandError>
 where
     F: FnOnce(&mut Vec<u8>) -> anyhow::Result<i32>,
 {
+    run_buffered_with_warnings(command, |out, _| run(out))
+}
+
+/// [`run_buffered`], for commands that also produce DIAGNOSTICS.
+///
+/// The envelope carries them in `warnings`. Reports write theirs to a sink
+/// rather than the process's stderr precisely so this can happen: an agent
+/// asking for a text or CSV budget report used to get a tidy `0.0%`-used row
+/// for a budget on a misspelled account, with the warning that says so written
+/// to a stream this envelope discards.
+fn run_buffered_with_warnings<F>(command: &str, run: F) -> Result<CommandOutput, CommandError>
+where
+    F: FnOnce(&mut Vec<u8>, &mut CollectedDiagnostics) -> anyhow::Result<i32>,
+{
     let mut stdout = Vec::new();
-    let exit_code = run(&mut stdout).map_err(|e| command_failed(&e))?;
+    let mut diagnostics = CollectedDiagnostics::default();
+    let exit_code = run(&mut stdout, &mut diagnostics).map_err(|e| command_failed(&e))?;
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
-    let result = command_result(command, &stdout, exit_code);
+    let mut result = command_result(command, &stdout, exit_code);
+    if !diagnostics.0.is_empty()
+        && let Value::Object(map) = &mut result
+    {
+        // One OBJECT per diagnostic, carrying the fields the report already
+        // knew. Reports used to hand over formatted lines, so this had to
+        // rebuild records by splitting on newlines — which a message carrying
+        // its own newline broke in half, and which discarded the date and the
+        // account outright.
+        let items: Vec<Value> = diagnostics
+            .0
+            .iter()
+            .map(|d| {
+                let mut o = serde_json::Map::new();
+                if let Some(code) = &d.code {
+                    o.insert("code".to_string(), json!(code));
+                }
+                if let Some(date) = d.date {
+                    o.insert("date".to_string(), json!(date.to_string()));
+                }
+                if let Some(account) = &d.account {
+                    o.insert("account".to_string(), json!(account));
+                }
+                o.insert("message".to_string(), json!(d.message));
+                Value::Object(o)
+            })
+            .collect();
+        map.insert("warnings".to_string(), json!(items));
+    }
     Ok(CommandOutput::new(result)
         .exit_code(exit_code)
         .next_action(NextAction::new(

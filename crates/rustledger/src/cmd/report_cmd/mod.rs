@@ -25,6 +25,7 @@
 mod accounts;
 mod balances;
 mod balsheet;
+mod budget;
 mod capgains;
 mod commodities;
 mod holdings;
@@ -212,6 +213,29 @@ pub enum Report {
         #[arg(long)]
         irr: bool,
     },
+    /// Budgeted vs actual spending, from Fava-compatible `custom "budget"` directives
+    Budget {
+        /// Only accounts under this prefix (default: all budgeted accounts).
+        #[arg(short, long)]
+        account: Option<String>,
+        /// Start of the reporting window, inclusive (`YYYY-MM-DD`).
+        /// Defaults to the start of the year `--to` falls in, so narrowing
+        /// `--to` narrows the window with it rather than silently reporting
+        /// from January of the CURRENT year against an older `--to`.
+        /// (No short flag: `-f` is the global `--format`.)
+        #[arg(long)]
+        from: Option<String>,
+        /// End of the reporting window, EXCLUSIVE (`YYYY-MM-DD`).
+        /// Defaults to tomorrow, so that the default window includes today.
+        /// (No short flag: `-t` is unused but `--to` stays symmetric with `--from`.)
+        #[arg(long)]
+        to: Option<String>,
+        /// Count spending in subaccounts toward a parent's budget, summing the
+        /// parent's own budget with any child budgets. Off by default, matching
+        /// Fava: a budget on `Expenses:Food` covers only that exact account.
+        #[arg(long)]
+        children: bool,
+    },
 }
 
 /// Run the report command with the given arguments.
@@ -238,7 +262,13 @@ pub fn run(
     // Existence check → load → (only now) create pager → render → finish.
     // Both the load and any render error surface BEFORE the pager exists,
     // so a bad file never flashes the alternate screen.
-    let loaded = load(file, report, verbose, no_cache)?;
+    let loaded = load(
+        file,
+        report,
+        verbose,
+        no_cache,
+        &mut DiagnosticsToWriter(io::stderr()),
+    )?;
 
     let use_pager = !no_pager && matches!(format, OutputFormat::Text);
     let pager_cmd = if use_pager {
@@ -257,7 +287,16 @@ pub fn run(
     // Always restore the terminal (drop the pager) even if rendering fails,
     // so a write error mid-report doesn't leave the terminal stuck in pager
     // mode.
-    let result = render(&loaded, report, file, format, &mut writer);
+    let result = // The terminal path sends diagnostics to stderr, where they
+    // interleave with the table above them.
+    render(
+        &loaded,
+        report,
+        file,
+        format,
+        &mut writer,
+        &mut DiagnosticsToWriter(io::stderr()),
+    );
     writer.finish();
     result
 }
@@ -272,18 +311,107 @@ pub fn run(
 /// stderr. The on-disk parse cache stays enabled: the load phase is always
 /// invoked with `no_cache = false` (this entry point takes no `no_cache`
 /// parameter).
+/// One thing a report needs to tell the reader that its figures cannot.
+///
+/// STRUCTURED, not a formatted line. Each surface decides how to show it: the
+/// terminal writes `warning: <date>: <message>` to stderr, and `ag-rledger`
+/// emits a JSON object per diagnostic. A text sink forced the agent surface to
+/// reconstruct records by splitting on newlines, which a message carrying its
+/// own newline (the "no budgets declared" note quotes an example directive)
+/// silently broke into two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    /// The error code, for diagnostics that have one (`E11001`, `LOAD`).
+    pub code: Option<String>,
+    /// The date the diagnostic is about, not the date it was produced.
+    pub date: Option<NaiveDate>,
+    /// The account it concerns, when it can be attributed to one.
+    pub account: Option<String>,
+    /// What is wrong, phrased for a human.
+    pub message: String,
+}
+
+impl Diagnostic {
+    /// A diagnostic with only prose — what most report warnings are.
+    pub fn message(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            date: None,
+            account: None,
+            message: message.into(),
+        }
+    }
+
+    /// The terminal rendering: what `rledger` writes to stderr.
+    #[must_use]
+    pub fn to_line(&self) -> String {
+        let mut out = String::from("warning: ");
+        if let Some(code) = &self.code {
+            out.push_str(code);
+            out.push_str(": ");
+        }
+        if let Some(date) = self.date {
+            out.push_str(&date.to_string());
+            out.push_str(": ");
+        }
+        out.push_str(&self.message);
+        out
+    }
+}
+
+/// Where a report's diagnostics go.
+///
+/// A trait rather than a writer so the agent surface can keep the fields. The
+/// CLI's implementation formats to stderr; `ag-rledger`'s collects records.
+pub trait Diagnostics {
+    /// Record one diagnostic.
+    fn emit(&mut self, diagnostic: Diagnostic);
+}
+
+/// Writes each diagnostic as a line — the terminal's behavior.
+pub struct DiagnosticsToWriter<W: io::Write>(pub W);
+
+impl<W: io::Write> Diagnostics for DiagnosticsToWriter<W> {
+    fn emit(&mut self, diagnostic: Diagnostic) {
+        // A failed WARNING write must never cost the reader the REPORT.
+        let _ = writeln!(self.0, "{}", diagnostic.to_line());
+    }
+}
+
+/// Keeps the records, for a caller that will serialize them.
+#[derive(Default)]
+pub struct CollectedDiagnostics(pub Vec<Diagnostic>);
+
+impl Diagnostics for CollectedDiagnostics {
+    fn emit(&mut self, diagnostic: Diagnostic) {
+        self.0.push(diagnostic);
+    }
+}
+
+/// `warnings` receives the report's diagnostics — budgets on accounts that are
+/// never opened, figures too large to represent, and the like.
+///
+/// A parameter rather than `eprintln!` because a report's warnings are part of
+/// its answer, and the caller decides where they belong. The CLI sends them to
+/// stderr, where a terminal interleaves them with the table. `ag-rledger`
+/// buffers them into its JSON envelope, which drops the process's real stderr —
+/// so before this, an agent asking for a text or CSV budget report received a
+/// tidy `0.0%`-used row for a budget on a misspelled account with nothing
+/// saying so. That is the silent misreport the diagnostics exist to catch,
+/// reintroduced on the one surface that cannot see past it.
 pub fn run_with_writer<W: io::Write>(
     file: &PathBuf,
     report: &Report,
     verbose: bool,
     format: &OutputFormat,
     out: &mut W,
+    warnings: &mut dyn Diagnostics,
 ) -> Result<()> {
     // Existence-check → load → render(buffer): the same two-phase split the
     // production `run()` uses, minus the pager. Producing identical report
     // bytes is guaranteed because both paths funnel through `load` + `render`.
-    let loaded = load(file, report, verbose, false)?;
-    render(&loaded, report, file, format, out)
+    let loaded = load(file, report, verbose, false, warnings)?;
+    render(&loaded, report, file, format, out, warnings)
 }
 
 /// Loaded directive views, the output of the load phase of a report.
@@ -325,7 +453,13 @@ struct LoadedReport {
 /// This is the load phase shared by [`run`] and [`run_with_writer`]. It
 /// performs the existence check, loads via the on-disk cache, processes, and
 /// computes the (optional) pad-expanded balance view — but renders nothing.
-fn load(file: &PathBuf, report: &Report, verbose: bool, no_cache: bool) -> Result<LoadedReport> {
+fn load(
+    file: &PathBuf,
+    report: &Report,
+    verbose: bool,
+    no_cache: bool,
+    warnings: &mut dyn Diagnostics,
+) -> Result<LoadedReport> {
     // Check if file exists
     if !file.exists() {
         anyhow::bail!("file not found: {}", file.display());
@@ -353,9 +487,19 @@ fn load(file: &PathBuf, report: &Report, verbose: bool, no_cache: bool) -> Resul
     let ledger = rustledger_loader::process(raw, &options)
         .with_context(|| format!("failed to load {}", file.display()))?;
 
-    // Report any errors
+    // To the caller's sink, like every other diagnostic. These are the ones an
+    // agent can least afford to miss: a parse failure means recovery may have
+    // dropped directives, so the report below is computed over less than the
+    // ledger says. Left on `eprintln!`, they reached the terminal and nothing
+    // else — a confident, complete-looking report over a file that did not
+    // parse, which is the failure the sink was introduced to end.
     for err in &ledger.errors {
-        eprintln!("{}: {}", err.code, err.message);
+        warnings.emit(Diagnostic {
+            code: Some(err.code.clone()),
+            date: None,
+            account: None,
+            message: err.message.clone(),
+        });
     }
 
     // Two views of the directive stream, chosen per-report below:
@@ -390,6 +534,10 @@ fn load(file: &PathBuf, report: &Report, verbose: bool, no_cache: bool) -> Resul
             // Returns extraction requires the booked, pad-expanded stream (its
             // terminal valuation realizes inventory, including pad-seeded lots).
             | Report::Returns { .. }
+            // Budget sums postings over a window, so pad-synthesized postings are
+            // spending like any other — without this the budget report disagreed
+            // with `balances`/`income` on the same ledger.
+            | Report::Budget { .. }
     );
     let has_pads = needs_balance_view
         && ledger
@@ -429,6 +577,7 @@ fn render<W: io::Write>(
     file: &PathBuf,
     format: &OutputFormat,
     writer: &mut W,
+    warnings: &mut dyn Diagnostics,
 ) -> Result<()> {
     let directives = &loaded.directives;
 
@@ -532,6 +681,7 @@ fn render<W: io::Write>(
                 &loaded.display_context,
                 format,
                 writer,
+                warnings,
             )?;
             // The report is already written. A partial `--by-group` report exits
             // non-zero so a pipeline gating on exit status does not treat an
@@ -577,6 +727,67 @@ fn render<W: io::Write>(
                 &loaded.display_context,
                 format,
                 writer,
+                warnings,
+            )?;
+        }
+        Report::Budget {
+            account,
+            from,
+            to,
+            children,
+        } => {
+            let parse_date = |s: &str| -> Result<NaiveDate> {
+                s.parse()
+                    .with_context(|| format!("invalid date {s:?} (expected YYYY-MM-DD)"))
+            };
+            // Default window: the current year to date. `to` is exclusive, so the
+            // default end is today + 1 day — otherwise today's own spending would
+            // be silently excluded from its own budget.
+            // Same clock source the returns report uses for its default horizon.
+            let today = jiff::Zoned::now().date();
+            let to_date = match to.as_deref() {
+                Some(s) => parse_date(s)?,
+                None => today
+                    .checked_add(jiff::Span::new().days(1))
+                    .unwrap_or(today),
+            };
+            // The default start is the first of the year *being reported on*, not
+            // of the current year: `--to 2025-01-01` asks about 2024, and
+            // anchoring the start to wall-clock `now` made that hard-error with
+            // an empty window. The sibling horizon-taking reports (returns,
+            // capgains) likewise derive their window from the supplied endpoint.
+            let from_date = match from.as_deref() {
+                Some(s) => parse_date(s)?,
+                None => to_date
+                    .checked_sub(jiff::Span::new().days(1))
+                    .unwrap_or(to_date)
+                    .first_of_year(),
+            };
+            // `--to` is exclusive, so `--from X --to X` is an empty window, not a
+            // single day. Rendering it produced a full table of authoritative
+            // all-zero rows, indistinguishable from "you budgeted nothing and
+            // spent nothing" — and `--from X --to X` is exactly what a user types
+            // for one day, since most CLIs read such a pair as inclusive.
+            if from_date >= to_date {
+                anyhow::bail!(
+                    "--from ({from_date}) is not before --to ({to_date}); the window is empty \
+                     (--to is EXCLUSIVE, so a single day is --from {from_date} --to <the next day>)"
+                );
+            }
+            let filter = budget::BudgetFilter {
+                account: account.as_deref(),
+                from: from_date,
+                to: to_date,
+                children: *children,
+            };
+            budget::report_budget(
+                balance_input,
+                &filter,
+                &loaded.account_types,
+                &loaded.display_context,
+                format,
+                writer,
+                warnings,
             )?;
         }
     }
@@ -637,6 +848,55 @@ pub(super) fn account_balances(
 // which is invalid JSON).
 pub(super) use rustledger_core::format::escape_csv as csv_escape;
 pub(super) use rustledger_core::format::escape_json as json_escape;
+
+/// Replace control characters (and the Unicode line/paragraph separators) with
+/// spaces so a value cannot break out of a fixed-width text row.
+///
+/// The text renderers lay rows out by column width, with no quoting of their
+/// own — CSV and JSON escape their fields, but text does not. A label carrying a
+/// raw newline therefore splits its row and can forge a convincing extra line in
+/// the table, including a fake `TOTAL`. Ledger-derived labels reach these
+/// renderers from places that accept arbitrary strings (metadata, and the budget
+/// report's quoted-account form), so sanitizing is the renderer's job.
+pub(super) fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Truncate a label to fit a text column, keeping the informative **tail**.
+///
+/// Account names share their head (`Expenses:Home:Improvements:…`), so cutting
+/// the tail is what makes two distinct accounts render as identical rows; the
+/// leading `…` marks the elision instead. Always sanitized first (see
+/// [`sanitize_display`]).
+pub(super) fn truncate_label(s: &str, width: usize) -> String {
+    let s = sanitize_display(s);
+    if s.chars().count() <= width {
+        return s;
+    }
+    // A zero-width column holds nothing, not an ellipsis: the fallback below
+    // returns "…" for `width == 0`, which is one character wider than the
+    // column it was asked to fit.
+    if width == 0 {
+        return String::new();
+    }
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(width.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{tail}")
+}
 
 #[derive(Default)]
 pub(super) struct LedgerStats {

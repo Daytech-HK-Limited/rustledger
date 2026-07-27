@@ -408,15 +408,29 @@ impl DisplayContext {
                     // currency with hundreds of mainstream postings.
                     ctx.update(p.amount.number, p.amount.currency.as_str());
                 }
-                Directive::Pad(_)
+                // A `custom` directive can carry amounts (Fava's
+                // `custom "budget" Expenses:Food "monthly" 400.00 USD`), but they
+                // deliberately do NOT inform display precision.
+                //
+                // They were tried as a source and are not one: the decimal count
+                // a user writes in a budget line is a stylistic choice about the
+                // DECLARATION, while the figure a budget report prints is
+                // pro-rated and a repeating decimal by construction. Taking the
+                // declared scale rounded `0.5 BTC` accrued over 14/31 of a month
+                // to `0.2` against a true 0.22580645 — 12% low — and taking an
+                // integer `1 BTC` pinned the currency to 0 dp. A consumer that
+                // needs to render a currency this context has never seen should
+                // choose its own precision (the budget report rounds and
+                // normalizes), rather than inferring one from metadata.
+                Directive::Custom(_)
+                | Directive::Pad(_)
                 | Directive::Open(_)
                 | Directive::Close(_)
                 | Directive::Commodity(_)
                 | Directive::Event(_)
                 | Directive::Query(_)
                 | Directive::Note(_)
-                | Directive::Document(_)
-                | Directive::Custom(_) => {}
+                | Directive::Document(_) => {}
             }
         }
 
@@ -1675,5 +1689,57 @@ mod tests {
             vec![("EUR".to_string(), 3), ("USD".to_string(), 4)],
             "the wire export reflects the fixed-table precedence"
         );
+    }
+}
+
+#[cfg(test)]
+mod custom_directive_precision_tests {
+    use super::*;
+    use crate::{Amount, Custom, Directive, MetaValue, Posting, Transaction, naive_date};
+    use rust_decimal_macros::dec;
+
+    fn custom_with_amount(day: u32, amount: Amount) -> Directive {
+        Directive::Custom(
+            Custom::new(naive_date(2024, 1, day).unwrap(), "budget")
+                .with_value(MetaValue::Amount(amount)),
+        )
+    }
+
+    /// Amounts inside `custom` directives do NOT inform display precision.
+    ///
+    /// The decimal count in a budget line is a stylistic choice about the
+    /// declaration; a budget report's figure is pro-rated and repeating by
+    /// construction. Inferring from the declaration rounded a 0.22580645 BTC
+    /// accrual to `0.2`. A consumer needing to render a currency this context
+    /// has never seen picks its own precision instead.
+    #[test]
+    fn custom_amounts_do_not_inform_precision() {
+        let directives = [custom_with_amount(1, Amount::new(dec!(0.5), "BTC"))];
+        let ctx = DisplayContext::from_directives(directives.iter(), std::iter::empty());
+        assert_eq!(ctx.get_precision("BTC"), None);
+        assert!(
+            !ctx.currencies().any(|c| c == "BTC"),
+            "a currency seen only in metadata must not enter the ledger's \
+             currency list, which crosses the FFI"
+        );
+    }
+
+    /// And they certainly must not outvote postings: three 4 dp budget lines
+    /// against one 2 dp posting once moved USD's mode to 4 dp, silently
+    /// re-rendering every report in the CLI.
+    #[test]
+    fn custom_amounts_do_not_outvote_postings() {
+        let directives = [
+            custom_with_amount(1, Amount::new(dec!(400.0000), "USD")),
+            custom_with_amount(2, Amount::new(dec!(100.0000), "USD")),
+            custom_with_amount(3, Amount::new(dec!(50.0000), "USD")),
+            Directive::Transaction(
+                Transaction::new(naive_date(2024, 2, 1).unwrap(), "a").with_synthesized_posting(
+                    Posting::new("Expenses:Food", Amount::new(dec!(10.00), "USD")),
+                ),
+            ),
+        ];
+        let ctx = DisplayContext::from_directives(directives.iter(), std::iter::empty());
+        assert_eq!(ctx.get_precision("USD"), Some(2));
     }
 }
