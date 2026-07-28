@@ -118,10 +118,33 @@ pub fn handle_document_link_resolve(link: DocumentLink) -> DocumentLink {
         } else {
             resolved_path.clone()
         };
-        if let Some(ref full_path) = target_path
-            && let Some(uri) = file_uri(full_path)
-        {
-            resolved.target = Some(uri);
+        if let Some(ref full_path) = target_path {
+            // Resolve through the OS before converting. `full_path` is a
+            // `Path::join` of the ledger's base and a possibly-relative
+            // include, so it can carry `..` — and POSIX applies `..` AFTER
+            // symlink resolution, which no lexical pass can reproduce. With
+            // `/base/view -> /base/real/ledger`, `/base/view/../attachments/x`
+            // EXISTS (the kernel lands on `/base/real/attachments/x`) while any
+            // textual normalization yields `/base/attachments/x`, which does
+            // not. `path_to_uri` deliberately does not normalize for exactly
+            // this reason, so the resolution belongs here, where we already
+            // know whether the file is there.
+            //
+            // This also makes the target agree with the tooltip (which asks
+            // `exists()`) and with the loader (which canonicalizes its source
+            // map), so a link names the file `rledger check` actually reads.
+            // When the file does NOT exist there is nothing to resolve and the
+            // un-normalized path is the honest answer; the tooltip says
+            // "File not found" in that case anyway.
+            let resolved_target = std::fs::canonicalize(full_path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(full_path));
+            match crate::path_to_uri(&resolved_target) {
+                Ok(uri) => resolved.target = Some(uri),
+                // Every sibling site warns; this one silently produced a link
+                // with no target, which an editor renders as unclickable text
+                // with no way to find out why.
+                Err(e) => tracing::warn!("document link: no file URI for {full_path}: {e}"),
+            }
         }
 
         // Set tooltip based on existence
@@ -149,6 +172,23 @@ pub fn handle_document_link_resolve(link: DocumentLink) -> DocumentLink {
 }
 
 /// Resolve a path to its full filesystem path.
+///
+/// `Path::join`, matching `rustledger_loader`'s own `base_dir.join(include_path)`
+/// exactly — including that a backslash is NOT a separator on Unix.
+///
+/// A previous `file_uri` helper mapped `\` to `/` unconditionally while
+/// building the URI, so a Windows-authored `document "statements\jan.pdf"`
+/// opened on Linux got a link pointing at `statements/jan.pdf`. That looks
+/// friendlier and is wrong: the loader joins the literal string, so
+/// `rledger check` looks for a file NAMED `statements\jan.pdf` and reports it
+/// missing. The link went somewhere the ledger does not. The same code checked
+/// `exists()` on the un-normalized path, so the tooltip already said "File not
+/// found" while the target claimed otherwise — one helper disagreeing with both
+/// the loader and itself.
+///
+/// Showing what the loader will actually do is the point of the feature, so a
+/// dead link for a genuinely dead include is the correct answer. Fixing it
+/// belongs in the loader, for both tools at once, or nowhere.
 fn resolve_full_path(path: &str, base_dir: &Option<String>) -> Option<String> {
     if Path::new(path).is_absolute() {
         Some(path.to_string())
@@ -176,39 +216,15 @@ fn resolve_full_path(path: &str, base_dir: &Option<String>) -> Option<String> {
 /// Absolute paths never reach this function, which is why they kept working and
 /// made the bug look Windows-specific when it is not.
 fn get_base_directory(uri: &Uri) -> Option<String> {
-    let path = crate::uri_to_path(uri)?;
+    let path = crate::uri_to_path(uri)
+        .map_err(|e| {
+            tracing::debug!(
+                "document links: no base directory for {}: {e}",
+                uri.as_str()
+            )
+        })
+        .ok()?;
     path.parent().map(|p| p.to_string_lossy().to_string())
-}
-
-/// Build a `file:` URI for a resolved filesystem path.
-///
-/// Percent-encodes the characters that cannot appear literally, and gives
-/// Windows paths the third slash (`file:///C:/x`) that a drive letter needs.
-/// `format!("file://{path}")` did neither, so a target under a directory with a
-/// space produced a URI the editor could not open even once the path resolved.
-fn file_uri(path: &str) -> Option<Uri> {
-    let mut encoded = String::with_capacity(path.len());
-    // A conservative allow-list: anything outside it is escaped. `/` stays a
-    // separator, and `:` is kept so a Windows drive letter survives.
-    //
-    // A BACKSLASH is a separator too, and becomes `/`. `resolve_full_path`
-    // builds its result with `Path::join`, which uses the platform separator,
-    // so on Windows this function receives `C:\Users\a b\x.txt`. Escaping
-    // those to `%5C` yields `file:///C:%5CUsers%5C...`, which an editor will not
-    // open — the fix for the path lookup would have shipped with the click
-    // target still broken, on the one platform the bug was reported from.
-    for b in path.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                encoded.push(b as char);
-            }
-            b'\\' => encoded.push('/'),
-            _ => encoded.push_str(&format!("%{b:02X}")),
-        }
-    }
-    // `/foo` -> `file:///foo`; `C:/foo` -> `file:///C:/foo`.
-    let slash = if encoded.starts_with('/') { "" } else { "/" };
-    format!("file://{slash}{encoded}").parse::<Uri>().ok()
 }
 
 /// Create a document link for a path found in source.
@@ -302,7 +318,9 @@ fn parse_include_line(
 #[cfg(test)]
 fn resolve_path_to_uri(path: &str, base_dir: &Option<String>) -> Option<Uri> {
     let resolved = resolve_full_path(path, base_dir)?;
-    format!("file://{}", resolved).parse().ok()
+    crate::path_to_uri(Path::new(&resolved))
+        .map_err(|e| tracing::warn!("document link: no file URI for {resolved}: {e}"))
+        .ok()
 }
 
 #[cfg(test)]
@@ -362,7 +380,11 @@ mod tests {
 
     #[test]
     fn test_resolve_path_to_uri() {
-        let base_dir = Some("/home/user/ledger".to_string());
+        let base_dir = Some(
+            crate::test_abs("home/user/ledger")
+                .to_string_lossy()
+                .into_owned(),
+        );
 
         let uri = resolve_path_to_uri("accounts.beancount", &base_dir);
         assert!(uri.is_some());
@@ -381,7 +403,7 @@ mod tests {
             tooltip: None,
             data: Some(serde_json::json!({
                 "path": "accounts.beancount",
-                "base_dir": "/home/user/ledger",
+                "base_dir": crate::test_abs("home/user/ledger").to_string_lossy(),
                 "kind": "include",
             })),
         };
@@ -482,12 +504,46 @@ mod tests {
         let resolved = handle_document_link_resolve(link);
         let tooltip = resolved.tooltip.unwrap();
         // The key assertion: a literal document is NOT glob-detected, so it
-        // resolves as an existing document rather than "no files match". (The
-        // bracketed path won't round-trip through a `file://` URI — a separate,
-        // pre-existing encoding limitation — so we don't assert on `target`.)
+        // resolves as an existing document rather than "no files match".
         assert!(
             tooltip.contains("Open document"),
             "document with [] in name must resolve literally: {tooltip}"
+        );
+        // And it is CLICKABLE. This used to say the bracketed path "won't
+        // round-trip through a `file://` URI — a separate, pre-existing
+        // encoding limitation — so we don't assert on `target`", which is why
+        // the limitation survived: the one end-to-end test over the exact
+        // reported symptom declined to look at the thing that was broken.
+        // `url` leaves `[` and `]` literal and `fluent_uri` refuses them, so
+        // `target` was `None` and the link was dead.
+        let target = resolved
+            .target
+            .expect("a bracketed document must be clickable");
+        assert!(
+            target.as_str().ends_with("Statement%5B2024-01%5D.pdf"),
+            "brackets must be percent-encoded: {}",
+            target.as_str()
+        );
+        // Compared in ONE spelling, because three are in play for this file and
+        // no two of them are the same string:
+        //
+        //   raw TempDir     macOS `/var/...`      Windows `...\RUNNER~1\...`
+        //   canonicalized   macOS `/private/var/` Windows `\\?\C:\...`
+        //   through the URI both prefixes dropped by `url`'s conversion
+        //
+        // The claim worth asserting is that the target NAMES THE FIXTURE, so
+        // both sides are resolved and then compared. Asserting on any single
+        // spelling passes on one platform and fails on the others, which is
+        // how the raw-path version of this got through review.
+        let target_path = crate::uri_to_path(&target).expect("target inverts");
+        assert_eq!(
+            target_path
+                .canonical_for_loader_lookup()
+                .expect("the target exists"),
+            dir.path()
+                .join(fname)
+                .canonicalize()
+                .expect("the fixture exists")
         );
     }
 
@@ -519,17 +575,23 @@ mod tests {
 
     #[test]
     fn test_resolve_full_path() {
-        let base_dir = Some("/home/user/ledger".to_string());
+        let base = crate::test_abs("home/user/ledger");
+        let base_dir = Some(base.to_string_lossy().into_owned());
 
-        // Relative path
+        // Relative path: joined onto the base, with the platform's separator —
+        // `Path::join`, exactly as the loader does it.
         let resolved = resolve_full_path("accounts.beancount", &base_dir);
         assert!(resolved.is_some());
-        assert_eq!(resolved.unwrap(), "/home/user/ledger/accounts.beancount");
+        assert_eq!(
+            resolved.unwrap(),
+            base.join("accounts.beancount").to_string_lossy()
+        );
 
-        // Absolute path
-        let resolved = resolve_full_path("/absolute/path.beancount", &base_dir);
+        // Absolute path: passed through untouched, base ignored.
+        let absolute = crate::test_abs("absolute/path.beancount");
+        let resolved = resolve_full_path(&absolute.to_string_lossy(), &base_dir);
         assert!(resolved.is_some());
-        assert_eq!(resolved.unwrap(), "/absolute/path.beancount");
+        assert_eq!(resolved.unwrap(), absolute.to_string_lossy());
 
         // No base dir
         let resolved = resolve_full_path("relative.beancount", &None);
@@ -542,6 +604,68 @@ mod uri_resolution_tests {
     use super::*;
     use std::str::FromStr;
 
+    /// A `..` that crosses a symlink resolves to the file the OS finds.
+    ///
+    /// POSIX applies `..` AFTER symlink resolution; a lexical pass does it
+    /// before, and the two name different files. `path_to_uri` briefly
+    /// normalized lexically so the two converters would be exact inverses,
+    /// which made this link's tooltip say "Open document" (it asks `exists()`,
+    /// so the OS answered) while its target named a file that does not exist.
+    ///
+    /// `cfg(unix)`: creating a symlink on Windows needs elevation or developer
+    /// mode, so the fixture cannot be built there.
+    #[cfg(unix)]
+    #[test]
+    fn a_dot_dot_across_a_symlink_resolves_the_way_the_os_does() {
+        let root = std::env::temp_dir().join(format!("rl-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real/ledger")).expect("mkdir");
+        std::fs::create_dir_all(root.join("real/attachments")).expect("mkdir");
+        std::fs::write(root.join("real/attachments/jan.pdf"), b"pdf").expect("write");
+        let view = root.join("view");
+        std::os::unix::fs::symlink(root.join("real/ledger"), &view).expect("symlink");
+
+        let link = DocumentLink {
+            range: lsp_types::Range {
+                start: lsp_types::Position::new(0, 9),
+                end: lsp_types::Position::new(0, 30),
+            },
+            target: None,
+            tooltip: None,
+            data: Some(serde_json::json!({
+                "path": "../attachments/jan.pdf",
+                "base_dir": view.to_string_lossy(),
+                "kind": "document",
+            })),
+        };
+        let resolved = handle_document_link_resolve(link);
+
+        let tooltip = resolved.tooltip.clone().unwrap_or_default();
+        assert!(
+            tooltip.starts_with("Open document"),
+            "the OS finds this file, so the tooltip must say so: {tooltip}"
+        );
+        let target = resolved
+            .target
+            .expect("a resolvable document must be clickable");
+        let target_path = crate::uri_to_path(&target).expect("target inverts");
+        assert!(
+            target_path.as_path().exists(),
+            "the tooltip says the file exists, so the target must name one that \
+             does: {}",
+            target.as_str()
+        );
+        assert_eq!(
+            target_path.as_path(),
+            root.join("real/attachments/jan.pdf")
+                .canonicalize()
+                .expect("canon"),
+            "and it must be the file the OS resolves to"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A relative `document` path must resolve under a directory whose URI is
     /// percent-encoded (issue #1866).
     ///
@@ -553,6 +677,7 @@ mod uri_resolution_tests {
     /// portable trigger means this runs everywhere, rather than on the one OS CI
     /// might not have.
     #[test]
+
     fn a_relative_document_resolves_under_a_percent_encoded_directory() {
         // Unique per process: a fixed name collides when two `cargo test`
         // processes run at once, or when a previous failed run left the
@@ -566,8 +691,19 @@ mod uri_resolution_tests {
                       2026-07-27 document Expenses:Probe \"neighbor.txt\"\n";
         std::fs::write(&ledger, source).expect("write ledger");
 
-        // The URI an editor actually sends: the space is encoded.
-        let uri_str = format!("file://{}", ledger.to_string_lossy().replace(' ', "%20"));
+        // The URI an editor actually sends. Built through `url` rather than by
+        // hand: an editor percent-encodes the space AND, on Windows, produces
+        // the three-slash drive form, which `format!("file://{}", ..)` does not.
+        // This is the client's job, not `proto`'s, so it is spelled out here
+        // rather than borrowed from `path_to_uri` — a test that builds its
+        // input with the code under test asserts only self-consistency.
+        let uri_str = url::Url::from_file_path(&ledger)
+            .expect("fixture path is absolute")
+            .to_string();
+        assert!(
+            uri_str.contains("%20"),
+            "the fixture must exercise encoding"
+        );
         let uri = Uri::from_str(&uri_str).expect("uri");
 
         let parse = rustledger_parser::parse(source);
@@ -593,27 +729,5 @@ mod uri_resolution_tests {
         assert!(!target.contains(' '), "raw space in a URI: {target}");
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A Windows-shaped path gets the third slash a drive letter needs, and
-    /// keeps the drive colon literal rather than escaping it.
-    #[test]
-    fn a_drive_letter_path_becomes_a_three_slash_uri() {
-        let uri = file_uri("C:/Users/a b/repro/neighbor.txt").expect("uri");
-        assert_eq!(
-            uri.as_str(),
-            "file:///C:/Users/a%20b/repro/neighbor.txt",
-            "`file://C:/…` is not a valid file URI and the editor cannot open it"
-        );
-        // A POSIX path already starts with `/`, so it must not gain a fourth.
-        let posix = file_uri("/home/a b/x.txt").expect("uri");
-        assert_eq!(posix.as_str(), "file:///home/a%20b/x.txt");
-
-        // The shape `Path::join` ACTUALLY produces on Windows: backslashes.
-        // Escaping them to `%5C` gives a URI no editor will open, and the test
-        // above would not have caught it because a hand-written `C:/…` is not
-        // what the code receives there.
-        let native = file_uri(r"C:\Users\a b\repro\neighbor.txt").expect("uri");
-        assert_eq!(native.as_str(), "file:///C:/Users/a%20b/repro/neighbor.txt");
     }
 }

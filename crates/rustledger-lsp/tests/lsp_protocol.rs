@@ -14,7 +14,7 @@ mod quirks;
 
 use std::time::{Duration, Instant};
 
-use harness::{LspTestClient, test_uri};
+use harness::{LspTestClient, include_name, same_file, test_uri, uri_for};
 use lsp_types::request::{CodeLensRequest, CodeLensResolve, SemanticTokensFullRequest};
 use lsp_types::{CodeLensParams, SemanticTokensParams, TextDocumentIdentifier};
 
@@ -22,6 +22,29 @@ use lsp_types::{CodeLensParams, SemanticTokensParams, TextDocumentIdentifier};
 /// `textDocument/codeLens` request, get a response. If this test
 /// fails the harness itself is broken; every other test in this
 /// binary builds on it.
+/// `same_file` must not answer "yes" for two different files.
+///
+/// It once did, for any pair that does not exist on disk: it compared
+/// `canonicalize().ok()` on both sides and `None == None` is true. Every
+/// `test_uri` names a path that never exists, so thirteen assertions built on
+/// this helper would have matched a notification about a DIFFERENT file. No
+/// test failed, because each happens to have only one file in play — the bug
+/// was latent, not absent, and the next multi-file test would have inherited a
+/// guard that cannot fail.
+#[test]
+fn same_file_distinguishes_two_paths_that_do_not_exist() {
+    let a: lsp_types::Uri = test_uri("aaa.beancount").parse().expect("uri");
+    let b = test_uri("bbb.beancount");
+    assert!(
+        !same_file(&a, &b),
+        "different names must not be the same file"
+    );
+    assert!(
+        same_file(&a, &test_uri("aaa.beancount")),
+        "identical must match"
+    );
+}
+
 #[test]
 fn harness_smoke_initialize_and_codelens() {
     let mut client = LspTestClient::spawn();
@@ -421,7 +444,7 @@ plugin \"beancount_reds_plugins.effective_date.effective_date\" \"{\n\
     let latest_payload = diagnostic_payloads
         .iter()
         .rev()
-        .find(|p| p.uri.as_str() == uri)
+        .find(|p| same_file(&p.uri, &uri))
         .unwrap_or_else(|| {
             panic!(
                 "no publishDiagnostics arrived for {uri}; captured \
@@ -530,7 +553,7 @@ fn real_balance_failure_round_trips_to_warning_lens() {
     let latest_payload = diagnostic_payloads
         .iter()
         .rev()
-        .find(|p| p.uri.as_str() == uri)
+        .find(|p| same_file(&p.uri, &uri))
         .unwrap_or_else(|| {
             panic!(
                 "no publishDiagnostics arrived for {uri}; captured \
@@ -598,17 +621,6 @@ fn real_balance_failure_round_trips_to_warning_lens() {
 /// `⚠`. The test passing means the validator's cross-file overlay
 /// AND the lens's verdict propagation both work.
 ///
-/// Gated on `cfg(unix)`: the `file://{path}` URI assembly below assumes
-/// the path starts with `/` (POSIX absolute), so on Windows it would
-/// produce `file://C:\...` (only two slashes plus drive letter) and
-/// fail Uri parsing — or worse, parse to a non-canonical URI that the
-/// server rejects and falls into single-file mode, producing a
-/// misleading `⚠` for "balance assertion failed" instead of a clean
-/// platform skip. `main_loop.rs` cfg-splits its URI assembly between
-/// Unix (`file://{}`) and Windows (`file:///{}`); a Windows-portable
-/// variant of this test would mirror that. Today CI is Linux-only, so
-/// the gate is a guardrail for the future.
-#[cfg(unix)]
 #[test]
 fn multi_file_balance_lens_reflects_cross_file_aggregation() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -640,8 +652,13 @@ fn multi_file_balance_lens_reflects_cross_file_aggregation() {
         &journal_path,
         format!(
             "include \"{}\"\ninclude \"{}\"\n",
-            bank_path.display(),
-            credit_card_path.display()
+            // Relative, because a backslash is an ESCAPE inside a beancount
+            // string: an absolute Windows path embedded here parses as
+            // `C:Users<tab>...`, the include never resolves, and the test waits
+            // for a diagnostic that is never produced. Real ledgers are written
+            // this way too.
+            include_name(&bank_path),
+            include_name(&credit_card_path)
         ),
     )
     .expect("write journal.beancount");
@@ -649,7 +666,7 @@ fn multi_file_balance_lens_reflects_cross_file_aggregation() {
     let mut client = LspTestClient::spawn_with_journal(Some(journal_path));
     client.initialize();
 
-    let bank_uri = format!("file://{}", bank_path.display());
+    let bank_uri = uri_for(&bank_path);
     let source = std::fs::read_to_string(&bank_path).expect("read bank");
     client.open_document(&bank_uri, &source);
 
@@ -698,7 +715,7 @@ fn multi_file_balance_lens_reflects_cross_file_aggregation() {
     let bank_diags = diagnostic_payloads
         .iter()
         .rev()
-        .find(|p| p.uri.as_str() == bank_uri)
+        .find(|p| same_file(&p.uri, &bank_uri))
         .unwrap_or_else(|| {
             panic!(
                 "no publishDiagnostics for {bank_uri}; captured: {:?}",
@@ -818,7 +835,6 @@ fn scratch_file_not_in_journal_uses_single_file_mode() {
 /// `CompletionItem` (not an array — a protocol violation), and when a
 /// `journalFile` is configured its documentation must aggregate over the whole
 /// loaded ledger, not the ephemeral buffer the completion was triggered in.
-#[cfg(unix)]
 #[test]
 fn completion_resolve_returns_single_item_and_uses_journal() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -841,7 +857,7 @@ fn completion_resolve_returns_single_item_and_uses_journal() {
 
     // An *ephemeral* buffer distinct from the journal (mirrors a client's
     // __test__.bean completion buffer).
-    let buf_uri = format!("file://{}", tmp.path().join("__buf__.beancount").display());
+    let buf_uri = uri_for(&tmp.path().join("__buf__.beancount"));
     client.open_document(&buf_uri, "2024-03-01 * \"x\"\n  Assets:Bank:Checking\n");
 
     // Resolve an account completion item whose `data.uri` points at the
@@ -899,9 +915,6 @@ fn completion_resolve_returns_single_item_and_uses_journal() {
 /// open buffer, never received a `publishDiagnostics`, so the problem was
 /// completely invisible.
 ///
-/// `cfg(unix)`: the `file://{path}` URI assembly assumes a POSIX absolute path
-/// (see `multi_file_balance_lens_reflects_cross_file_aggregation`).
-#[cfg(unix)]
 #[test]
 fn included_file_validation_errors_are_published() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -928,8 +941,13 @@ fn included_file_validation_errors_are_published() {
         &journal_path,
         format!(
             "include \"{}\"\ninclude \"{}\"\n",
-            good_path.display(),
-            bad_path.display()
+            // Relative, because a backslash is an ESCAPE inside a beancount
+            // string: an absolute Windows path embedded here parses as
+            // `C:Users<tab>...`, the include never resolves, and the test waits
+            // for a diagnostic that is never produced. Real ledgers are written
+            // this way too.
+            include_name(&good_path),
+            include_name(&bad_path)
         ),
     )
     .expect("write journal");
@@ -938,11 +956,11 @@ fn included_file_validation_errors_are_published() {
     client.initialize();
 
     // Open ONLY good.beancount; bad.beancount stays unopened.
-    let good_uri = format!("file://{}", good_path.display());
+    let good_uri = uri_for(&good_path);
     let good_src = std::fs::read_to_string(&good_path).expect("read good");
     client.open_document(&good_uri, &good_src);
 
-    let bad_uri = format!("file://{}", bad_path.display());
+    let bad_uri = uri_for(&bad_path);
 
     // Drain publishDiagnostics until bad.beancount's (non-empty) arrive.
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -961,7 +979,7 @@ fn included_file_validation_errors_are_published() {
             let p: lsp_types::PublishDiagnosticsParams =
                 serde_json::from_value(n.params).expect("valid publishDiagnostics");
             seen.push(p.uri.as_str().to_string());
-            if p.uri.as_str() == bad_uri && !p.diagnostics.is_empty() {
+            if same_file(&p.uri, &bad_uri) && !p.diagnostics.is_empty() {
                 break Some(p);
             }
         }
@@ -985,7 +1003,6 @@ fn included_file_validation_errors_are_published() {
 /// fixed, its diagnostics must be explicitly CLEARED (an empty publish), not
 /// left lingering in the client. Exercises `publish_cross_file_diagnostics`'s
 /// stale-clearing path via a watched-file change that reloads the journal.
-#[cfg(unix)]
 #[test]
 fn included_file_diagnostics_are_cleared_when_fixed() {
     use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
@@ -1009,20 +1026,25 @@ fn included_file_diagnostics_are_cleared_when_fixed() {
         &journal_path,
         format!(
             "include \"{}\"\ninclude \"{}\"\n",
-            good_path.display(),
-            bad_path.display()
+            // Relative, because a backslash is an ESCAPE inside a beancount
+            // string: an absolute Windows path embedded here parses as
+            // `C:Users<tab>...`, the include never resolves, and the test waits
+            // for a diagnostic that is never produced. Real ledgers are written
+            // this way too.
+            include_name(&good_path),
+            include_name(&bad_path)
         ),
     )
     .expect("write journal");
 
     let mut client = LspTestClient::spawn_with_journal(Some(journal_path));
     client.initialize();
-    let good_uri = format!("file://{}", good_path.display());
+    let good_uri = uri_for(&good_path);
     client.open_document(
         &good_uri,
         &std::fs::read_to_string(&good_path).expect("read good"),
     );
-    let bad_uri = format!("file://{}", bad_path.display());
+    let bad_uri = uri_for(&bad_path);
 
     // Drain publishDiagnostics until bad.beancount reaches the desired emptiness.
     let drain = |client: &mut LspTestClient, want_empty: bool| -> bool {
@@ -1040,7 +1062,7 @@ fn included_file_diagnostics_are_cleared_when_fixed() {
             {
                 let p: lsp_types::PublishDiagnosticsParams =
                     serde_json::from_value(n.params).expect("valid publishDiagnostics");
-                if p.uri.as_str() == bad_uri && p.diagnostics.is_empty() == want_empty {
+                if same_file(&p.uri, &bad_uri) && p.diagnostics.is_empty() == want_empty {
                     return true;
                 }
             }
@@ -1100,8 +1122,13 @@ fn editing_a_non_ledger_buffer_keeps_unopened_file_diagnostics() {
         &journal_path,
         format!(
             "include \"{}\"\ninclude \"{}\"\n",
-            good_path.display(),
-            bad_path.display()
+            // Relative, because a backslash is an ESCAPE inside a beancount
+            // string: an absolute Windows path embedded here parses as
+            // `C:Users<tab>...`, the include never resolves, and the test waits
+            // for a diagnostic that is never produced. Real ledgers are written
+            // this way too.
+            include_name(&good_path),
+            include_name(&bad_path)
         ),
     )
     .expect("write journal");
@@ -1109,12 +1136,12 @@ fn editing_a_non_ledger_buffer_keeps_unopened_file_diagnostics() {
     let mut client = LspTestClient::spawn_with_journal(Some(journal_path));
     client.initialize();
 
-    let good_uri = format!("file://{}", good_path.display());
+    let good_uri = uri_for(&good_path);
     client.open_document(
         &good_uri,
         &std::fs::read_to_string(&good_path).expect("read good"),
     );
-    let bad_uri = format!("file://{}", bad_path.display());
+    let bad_uri = uri_for(&bad_path);
 
     // Phase 1: wait until bad.beancount's error is published.
     let wait_bad = |client: &mut LspTestClient, want_empty: bool| -> bool {
@@ -1132,7 +1159,7 @@ fn editing_a_non_ledger_buffer_keeps_unopened_file_diagnostics() {
             {
                 let p: lsp_types::PublishDiagnosticsParams =
                     serde_json::from_value(n.params).expect("valid publishDiagnostics");
-                if p.uri.as_str() == bad_uri && p.diagnostics.is_empty() == want_empty {
+                if same_file(&p.uri, &bad_uri) && p.diagnostics.is_empty() == want_empty {
                     return true;
                 }
             }
@@ -1144,7 +1171,7 @@ fn editing_a_non_ledger_buffer_keeps_unopened_file_diagnostics() {
     );
 
     // Phase 2: open + edit a scratch buffer that is NOT part of the ledger.
-    let scratch_uri = format!("file://{}", scratch_path.display());
+    let scratch_uri = uri_for(&scratch_path);
     client.open_document(&scratch_uri, "; scratch\n");
     client.notify::<lsp_types::notification::DidChangeTextDocument>(
         lsp_types::DidChangeTextDocumentParams {
@@ -1178,7 +1205,7 @@ fn editing_a_non_ledger_buffer_keeps_unopened_file_diagnostics() {
             let p: lsp_types::PublishDiagnosticsParams =
                 serde_json::from_value(n.params).expect("valid publishDiagnostics");
             assert!(
-                !(p.uri.as_str() == bad_uri && p.diagnostics.is_empty()),
+                !(same_file(&p.uri, &bad_uri) && p.diagnostics.is_empty()),
                 "editing a non-ledger scratch buffer must not clear the unopened \
                  included file's diagnostics (#1813 review)"
             );
@@ -1265,7 +1292,6 @@ fn async_request_invalidated_by_edit_still_gets_a_response() {
 /// Regression: `workspace/symbol` must search the whole loaded ledger, not just
 /// open buffers — an account declared in an unopened `include`d file must be
 /// findable. Pre-fix the search only consulted open documents.
-#[cfg(unix)]
 #[test]
 fn workspace_symbol_finds_symbols_in_unopened_included_files() {
     use lsp_types::request::WorkspaceSymbolRequest;
@@ -1280,8 +1306,13 @@ fn workspace_symbol_finds_symbols_in_unopened_included_files() {
         &journal_path,
         format!(
             "include \"{}\"\ninclude \"{}\"\n",
-            main_path.display(),
-            inc_path.display()
+            // Relative, because a backslash is an ESCAPE inside a beancount
+            // string: an absolute Windows path embedded here parses as
+            // `C:Users<tab>...`, the include never resolves, and the test waits
+            // for a diagnostic that is never produced. Real ledgers are written
+            // this way too.
+            include_name(&main_path),
+            include_name(&inc_path)
         ),
     )
     .expect("write journal");
@@ -1289,7 +1320,7 @@ fn workspace_symbol_finds_symbols_in_unopened_included_files() {
     let mut client = LspTestClient::spawn_with_journal(Some(journal_path));
     client.initialize();
     // Open only main.beancount; inc.beancount stays unopened.
-    let main_uri = format!("file://{}", main_path.display());
+    let main_uri = uri_for(&main_path);
     client.open_document(
         &main_uri,
         &std::fs::read_to_string(&main_path).expect("read main"),
@@ -1315,7 +1346,6 @@ fn workspace_symbol_finds_symbols_in_unopened_included_files() {
 /// Regression: renaming an account used across `include`d files must produce
 /// edits for ALL files, not just the open one — otherwise the rename leaves
 /// dangling references in the other files and corrupts the ledger.
-#[cfg(unix)]
 #[test]
 #[allow(clippy::mutable_key_type)] // Uri keys in the WorkspaceEdit changes map are safe to read
 fn rename_account_spans_included_files() {
@@ -1337,15 +1367,20 @@ fn rename_account_spans_included_files() {
         &journal_path,
         format!(
             "include \"{}\"\ninclude \"{}\"\n",
-            main_path.display(),
-            inc_path.display()
+            // Relative, because a backslash is an ESCAPE inside a beancount
+            // string: an absolute Windows path embedded here parses as
+            // `C:Users<tab>...`, the include never resolves, and the test waits
+            // for a diagnostic that is never produced. Real ledgers are written
+            // this way too.
+            include_name(&main_path),
+            include_name(&inc_path)
         ),
     )
     .expect("write journal");
 
     let mut client = LspTestClient::spawn_with_journal(Some(journal_path));
     client.initialize();
-    let main_uri = format!("file://{}", main_path.display());
+    let main_uri = uri_for(&main_path);
     client.open_document(
         &main_uri,
         &std::fs::read_to_string(&main_path).expect("read main"),
@@ -1368,21 +1403,20 @@ fn rename_account_spans_included_files() {
         .expect("rename returned an edit")
         .changes
         .expect("workspace edit has per-file changes");
-    let inc_uri = format!("file://{}", inc_path.display());
+    let inc_uri = uri_for(&inc_path);
     let edited_uris: Vec<&str> = changes.keys().map(|u| u.as_str()).collect();
     assert!(
-        changes.keys().any(|u| u.as_str() == main_uri),
+        changes.keys().any(|u| same_file(u, &main_uri)),
         "rename must edit the open file; edited: {edited_uris:?}"
     );
     assert!(
-        changes.keys().any(|u| u.as_str() == inc_uri),
+        changes.keys().any(|u| same_file(u, &inc_uri)),
         "rename must also edit the included file (cross-file usage); edited: {edited_uris:?}"
     );
 }
 
 /// Regression: find-references on an account used across `include`d files must
 /// return locations in ALL files, not just the open one.
-#[cfg(unix)]
 #[test]
 fn references_span_included_files() {
     use lsp_types::request::References;
@@ -1402,15 +1436,20 @@ fn references_span_included_files() {
         &journal_path,
         format!(
             "include \"{}\"\ninclude \"{}\"\n",
-            main_path.display(),
-            inc_path.display()
+            // Relative, because a backslash is an ESCAPE inside a beancount
+            // string: an absolute Windows path embedded here parses as
+            // `C:Users<tab>...`, the include never resolves, and the test waits
+            // for a diagnostic that is never produced. Real ledgers are written
+            // this way too.
+            include_name(&main_path),
+            include_name(&inc_path)
         ),
     )
     .expect("write journal");
 
     let mut client = LspTestClient::spawn_with_journal(Some(journal_path));
     client.initialize();
-    let main_uri = format!("file://{}", main_path.display());
+    let main_uri = uri_for(&main_path);
     client.open_document(
         &main_uri,
         &std::fs::read_to_string(&main_path).expect("read main"),
@@ -1432,14 +1471,14 @@ fn references_span_included_files() {
             partial_result_params: Default::default(),
         });
     let locations = locations.unwrap_or_default();
-    let inc_uri = format!("file://{}", inc_path.display());
+    let inc_uri = uri_for(&inc_path);
     let uris: Vec<&str> = locations.iter().map(|l| l.uri.as_str()).collect();
     assert!(
-        locations.iter().any(|l| l.uri.as_str() == main_uri),
+        locations.iter().any(|l| same_file(&l.uri, &main_uri)),
         "references must include the open file's open directive; got: {uris:?}"
     );
     assert!(
-        locations.iter().any(|l| l.uri.as_str() == inc_uri),
+        locations.iter().any(|l| same_file(&l.uri, &inc_uri)),
         "references must include the usage in the included file; got: {uris:?}"
     );
 }

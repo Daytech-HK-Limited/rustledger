@@ -474,9 +474,106 @@ fn minimal_server_capabilities() -> serde_json::Value {
 /// Compose a typical `file://` URI for a test document. Use this so
 /// every test agrees on the URI format without each one having to
 /// remember the `file:///` prefix.
+///
+/// The name is anchored to an absolute path for the RUNNING platform, not
+/// pasted after `file:///`. `file:///smoke.beancount` has no drive letter, so
+/// on Windows it is not a local file at all: the server cannot resolve it,
+/// never answers, and the test fails 15 seconds later on a timeout rather than
+/// on anything to do with its subject.
 #[must_use]
 pub fn test_uri(name: &str) -> String {
-    format!("file:///{}", name)
+    let base = if cfg!(windows) {
+        std::path::PathBuf::from("C:\\lsp-tests")
+    } else {
+        std::path::PathBuf::from("/lsp-tests")
+    };
+    uri_for(&base.join(name))
+}
+
+/// The `file:` URI for a real path on disk.
+///
+/// Through the crate's own converter, because these tests need A valid URI for
+/// a temp file — the URI is not their subject, the protocol behavior is.
+/// `format!("file://{}", path.display())` was used at fifteen sites and omits
+/// the third slash of a Windows drive URI and percent-encodes nothing, so every
+/// one of them failed the moment this suite first ran on Windows.
+///
+/// A test whose SUBJECT is the encoding must build its input independently
+/// instead — see `a_relative_document_resolves_under_a_percent_encoded_directory`.
+#[must_use]
+pub fn uri_for(path: &std::path::Path) -> String {
+    rustledger_lsp::path_to_uri(path)
+        .unwrap_or_else(|e| panic!("no file URI for {}: {e}", path.display()))
+        .as_str()
+        .to_string()
+}
+
+/// The file name, for writing an `include` into a ledger fixture.
+///
+/// An `include` target is a beancount STRING, where `\` is an escape: an
+/// absolute Windows path written into one parses as `C:Users<tab>...` — `\t`
+/// really does become a tab — so the include silently resolves to nothing.
+/// Four fixtures did this, and only one of them failed; the other three went on
+/// passing on Windows while the ledger they set up was not the ledger they
+/// meant. Includes here are relative to the journal's own directory, which is
+/// how real ledgers are written anyway.
+#[must_use]
+pub fn include_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .expect("fixture paths have a file name")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Do these two URIs name the same file?
+///
+/// Compares PATHS, never the URI strings. One file has many URI spellings, and
+/// the server builds its own from the loader's canonicalized source-map path
+/// while a test builds one from the temp directory it created. On Linux those
+/// happen to be the same string. On Windows they are not — `std::env::temp_dir`
+/// hands back a path whose case, and sometimes 8.3 short form, differs from
+/// what `canonicalize` returns — so `p.uri.as_str() == expected` silently never
+/// matched and the test sat waiting for a notification that had already
+/// arrived, failing 15 seconds later on a timeout.
+///
+/// This is the same defect the diagnostics cache had, in a test rather than in
+/// the server: a `Uri` is a string, and a string is not an identity.
+#[must_use]
+pub fn same_file(uri: &lsp_types::Uri, expected: &str) -> bool {
+    let expected: lsp_types::Uri = match expected.parse() {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match (
+        rustledger_lsp::uri_to_path(uri),
+        rustledger_lsp::uri_to_path(&expected),
+    ) {
+        // `canonical_for_loader_lookup`, not `canonicalize`: the server's path
+        // comes from the loader's canonicalized source map and the test's from
+        // the temp dir it made, so this is the loader-spelling question, not
+        // the identity one. `AbsPathBuf` will not compile the latter.
+        //
+        // BOTH sides must resolve for the canonical comparison to mean
+        // anything. An earlier version wrote `a.canonical() == b.canonical()`,
+        // and for two paths that do not exist that is `None == None` — true.
+        // Every `test_uri` names a path that never exists, so this helper
+        // answered "same file" for ANY pair of unresolvable URIs, and thirteen
+        // assertions built on it matched whatever notification arrived first.
+        // The guard written to stop tests asserting nothing became one.
+        (Ok(a), Ok(b)) => {
+            if a == b {
+                return true;
+            }
+            match (
+                a.canonical_for_loader_lookup(),
+                b.canonical_for_loader_lookup(),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// `Option` views of the response's result/error. lsp-server 0.10 stores these

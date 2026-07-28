@@ -185,6 +185,52 @@ jobs:
       - name: Forbid std::sync Mutex/RwLock in library code
         run: ./scripts/check-sync-primitives.sh
 
+  # The ONLY job in this repo that runs `cargo test` off Linux.
+  #
+  # `rustledger-lsp` is where platform-specific path handling actually lives:
+  # `url::Url::from_file_path` decides what is absolute using the HOST
+  # platform's rules, so the drive-letter and UNC shapes cannot be faked on
+  # Linux — asserting a hand-written `C:/x` there tests a shape the code never
+  # receives, which is how the backslash bug in #1867 got through. The tests
+  # were therefore written `#[cfg(windows)]`, and then ran nowhere at all: the
+  # only `windows-latest` jobs in this repo download a published binary and run
+  # `rledger check`, so no Windows `cargo test` existed. A `cfg` that nothing
+  # compiles is an assertion nobody makes.
+  #
+  # Scoped to the one crate rather than the workspace: this is about path/URI
+  # conversion, and a full cross-platform workspace run is a much larger
+  # commitment than the problem needs.
+  #
+  # macOS covers a DIFFERENT axis than Windows. Its filesystem is
+  # case-insensitive but case-PRESERVING, so `/Users/rob/Ledger.beancount` and
+  # `/users/rob/ledger.beancount` are one file with two paths that compare
+  # unequal — the same "a string is not an identity" failure the diagnostics
+  # cache had, on a platform where paths look POSIX and every other Linux
+  # assumption holds. Windows cannot surface that one: its separator and drive
+  # differences make such tests fail loudly rather than pass quietly.
+  lsp-platform:
+    name: LSP (${{ matrix.os }})
+    needs: [changes]
+    if: needs.changes.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # one platform's failure must not hide the other's
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: 1.97.0 # pinned stable — bump deliberately, IN LOCKSTEP with rust-toolchain.toml (see #1745, #1750)
+      # Required: sccache is RUSTC_WRAPPER at the workflow level, so a job that
+      # compiles Rust without installing it dies on cargo's `-vV` probe with
+      # "could not execute process sccache" — which is how this job failed the
+      # first time it ran.
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - name: Test rustledger-lsp on Windows
+        run: cargo test -p rustledger-lsp
+
   # Plugin-test policies (Phase 5 of plugin-testing-quality plan, see #992).
   # Catches weak count assertions and `(partial)` test ports that tend to
   # silently mask plugin bugs.
@@ -458,7 +504,7 @@ jobs:
     name: build
     if: always()
     runs-on: ubuntu-latest
-    needs: [changes, fmt, unsafe-invariant, sync-primitives, hot-path-collections, plugin-test-quality, ci, doctest, regressions, bench-build, bindings-fresh, component-parity, wit-version-gate]
+    needs: [changes, fmt, unsafe-invariant, sync-primitives, hot-path-collections, plugin-test-quality, lsp-platform, ci, doctest, regressions, bench-build, bindings-fresh, component-parity, wit-version-gate]
     steps:
       - name: Check results
         run: |
@@ -490,7 +536,10 @@ jobs:
           # part of the gate (ADR-0004 Phase 3 / #1232): wire-format
           # drift in the generated TS / JSON Schema / Python artifacts
           # blocks merge just like any other failure.
-          results="${{ needs.fmt.result }} ${{ needs.unsafe-invariant.result }} ${{ needs.sync-primitives.result }} ${{ needs.hot-path-collections.result }} ${{ needs.ci.result }} ${{ needs.doctest.result }} ${{ needs.regressions.result }} ${{ needs.bench-build.result }} ${{ needs.bindings-fresh.result }} ${{ needs.component-parity.result }}"
+          # lsp-platform (windows + macos) is in the gate: it found 25 real
+          # defects on its first runs, every one of them unreachable from
+          # Linux, so a red platform leg must block exactly like a red `ci`.
+          results="${{ needs.fmt.result }} ${{ needs.unsafe-invariant.result }} ${{ needs.sync-primitives.result }} ${{ needs.hot-path-collections.result }} ${{ needs.lsp-platform.result }} ${{ needs.ci.result }} ${{ needs.doctest.result }} ${{ needs.regressions.result }} ${{ needs.bench-build.result }} ${{ needs.bindings-fresh.result }} ${{ needs.component-parity.result }}"
           echo "Job results: $results"
 
           if echo "$results" | grep -qE '(failure|cancelled)'; then
