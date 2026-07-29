@@ -429,6 +429,16 @@ pub fn process(raw: LoadResult, options: &LoadOptions) -> Result<Ledger, Process
     // only when the caller asked for them (the capgains report) — no consumer pays
     // to retain them otherwise.
     let mut capital_gains: Vec<rustledger_booking::CapitalGain> = Vec::new();
+    // Daytech fork: hand `option "inferred_tolerance_default"` to interpolation.
+    // Upstream only feeds it to balance checking, so auto-filled postings kept
+    // full `units x per_unit` precision where beancount quantizes them.
+    rustledger_booking::set_tolerance_defaults(
+        raw.options
+            .inferred_tolerance_default
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
+    );
     let (booked, failed) = directives.book(
         effective_booking_method,
         &mut errors,
@@ -814,7 +824,22 @@ fn run_booking(
     let mut order: Vec<usize> = (0..directives.len()).collect();
     order.sort_by_key(|&i| rustledger_core::booking_sort_key(&directives[i].value));
 
+    /// True when booking failed because the lots ran out (as opposed to never
+    /// matching). See the drop decision at the call site.
+    fn is_insufficient_units(e: &rustledger_booking::BookingError) -> bool {
+        matches!(
+            e,
+            rustledger_booking::BookingError::Inventory(a)
+                if matches!(
+                    a.error,
+                    rustledger_core::BookingError::InsufficientUnits { .. }
+                )
+        )
+    }
+
     let mut failed_indices: Vec<usize> = Vec::new();
+    // Daytech fork: transactions to discard outright — neither booked nor re-merged.
+    let mut dropped_indices: Vec<usize> = Vec::new();
     for &i in &order {
         let spanned = &mut directives[i];
         if let Directive::Transaction(txn) = &mut spanned.value {
@@ -831,7 +856,30 @@ fn run_booking(
                         "BOOK",
                         format!("{} ({}, \"{}\")", e, txn.date, txn.narration),
                     ));
-                    failed_indices.push(i);
+                    // Daytech fork: a reduction that ran out of units is DISCARDED,
+                    // not re-merged.
+                    //
+                    // Upstream keeps every failed transaction so the user still sees
+                    // what they wrote, but its postings stay raw in the directive
+                    // list and BQL then sums them at face value, as if they had
+                    // booked. beancount does the opposite here: `book_reductions`
+                    // does `return [], errors`, dropping every posting of the
+                    // offending currency group, so the transaction contributes
+                    // nothing to any balance.
+                    //
+                    // Real case: `-50000 XAU {"LABEL"}` against 13438.52 available.
+                    // The spec carries no cost number so no short lot can be priced
+                    // (see `short_lot`) and both engines error -- but re-merging made
+                    // rledger report -25114.67 XAU where beancount reports 24885.33.
+                    //
+                    // Only this error class is dropped. `NoMatchingLot` is a gap in
+                    // *our* lot matching for transactions beancount books fine, so
+                    // discarding those would delete real postings.
+                    if is_insufficient_units(&e) {
+                        dropped_indices.push(i);
+                    } else {
+                        failed_indices.push(i);
+                    }
                 }
             }
         }
@@ -843,10 +891,14 @@ fn run_booking(
     // partition is fait accompli — no window where a caller could
     // accidentally mutate between collection and partition.
     let failed_set: rustc_hash::FxHashSet<usize> = failed_indices.iter().copied().collect();
+    let dropped_set: rustc_hash::FxHashSet<usize> = dropped_indices.iter().copied().collect();
     let mut booked = Vec::with_capacity(directives.len() - failed_indices.len());
     let mut failed = Vec::with_capacity(failed_indices.len());
     for (i, d) in directives.into_iter().enumerate() {
-        if failed_set.contains(&i) {
+        if dropped_set.contains(&i) {
+            // Daytech fork: goes nowhere. Booking it would over-sell the inventory,
+            // re-merging it would let BQL sum its raw postings at face value.
+        } else if failed_set.contains(&i) {
             failed.push(d);
         } else {
             booked.push(d);

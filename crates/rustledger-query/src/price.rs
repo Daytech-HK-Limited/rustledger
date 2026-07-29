@@ -67,6 +67,19 @@ pub struct PriceDatabase {
         rustledger_core::Currency,
         HashMap<rustledger_core::Currency, Vec<(NaiveDate, Decimal)>>,
     >,
+    /// Daytech fork: the same index built from EXPLICIT prices only.
+    ///
+    /// beanquery's `convert()` reads `context.tables['prices'].price_map`, which
+    /// holds real `Price` directives (including any the `implicit_prices` plugin
+    /// emitted) and nothing else. rustledger additionally mints rates from every
+    /// cost annotation so `VALUE()` works without the plugin -- a deliberate
+    /// extension, but it made `convert(inventory,'HKD')` price gold at its cost
+    /// basis where beancount leaves it in XAU. 22.2M HKD of phantom balance on
+    /// the production gold ledger.
+    lookup_explicit: HashMap<
+        rustledger_core::Currency,
+        HashMap<rustledger_core::Currency, Vec<(NaiveDate, Decimal)>>,
+    >,
 }
 
 /// One raw price observation in ledger order — input to the
@@ -77,6 +90,10 @@ struct RawPrice {
     quote: rustledger_core::Currency,
     date: NaiveDate,
     rate: Decimal,
+    /// Daytech fork: true for a real `Price` directive, false for a rate
+    /// derived from a posting's cost/price annotation. `convert()` consults
+    /// only the explicit ones -- see `lookup_explicit`.
+    explicit: bool,
 }
 
 /// The [`PriceDatabase`] → [`PriceOracle`](rustledger_returns::PriceOracle)
@@ -101,6 +118,7 @@ impl PriceDatabase {
             prices: HashMap::default(),
             raw_seq: Vec::new(),
             lookup: HashMap::default(),
+            lookup_explicit: HashMap::default(),
         }
     }
 
@@ -208,13 +226,29 @@ impl PriceDatabase {
     /// 4. Materialize the inverse of every surviving pair, so the
     ///    index is direction-blind at lookup time.
     fn rebuild_lookup(&mut self) {
+        // Daytech fork: build the all-prices index, then the explicit-only one
+        // the beancount-faithful `convert()` uses.
+        self.lookup = Self::build_index(&self.raw_seq, false);
+        self.lookup_explicit = Self::build_index(&self.raw_seq, true);
+    }
+
+    /// Build a conversion index from `raw`, optionally keeping only explicit
+    /// (real `Price` directive) entries.
+    #[allow(clippy::type_complexity)]
+    fn build_index(
+        raw_seq: &[RawPrice],
+        explicit_only: bool,
+    ) -> HashMap<
+        rustledger_core::Currency,
+        HashMap<rustledger_core::Currency, Vec<(NaiveDate, Decimal)>>,
+    > {
         type Pair = (rustledger_core::Currency, rustledger_core::Currency);
 
         // Step 1: group per pair in insertion order.
         let mut order: Vec<Pair> = Vec::new();
         let mut index: HashMap<Pair, usize> = HashMap::default();
         let mut lists: Vec<Option<Vec<(NaiveDate, Decimal)>>> = Vec::new();
-        for raw in &self.raw_seq {
+        for raw in raw_seq.iter().filter(|r| !explicit_only || r.explicit) {
             let key = (raw.base.clone(), raw.quote.clone());
             let i = *index.entry(key.clone()).or_insert_with(|| {
                 order.push(key);
@@ -271,19 +305,22 @@ impl PriceDatabase {
         // Step 4: materialize all inverses. After step 2 at most one
         // direction per pair survives, so these inserts cannot
         // collide with a surviving forward list.
-        self.lookup = HashMap::default();
+        let mut out: HashMap<
+            rustledger_core::Currency,
+            HashMap<rustledger_core::Currency, Vec<(NaiveDate, Decimal)>>,
+        > = HashMap::default();
         for ((base, quote), list) in merged {
             let inverted: Vec<(NaiveDate, Decimal)> = list
                 .iter()
                 .filter(|(_, rate)| !rate.is_zero())
                 .map(|&(d, rate)| (d, Decimal::ONE / rate))
                 .collect();
-            self.lookup
-                .entry(quote.clone())
+            out.entry(quote.clone())
                 .or_default()
                 .insert(base.clone(), inverted);
-            self.lookup.entry(base).or_default().insert(quote, list);
+            out.entry(base).or_default().insert(quote, list);
         }
+        out
     }
 
     /// Add a price directive to the database.
@@ -303,6 +340,7 @@ impl PriceDatabase {
             quote: price.amount.currency.clone(),
             date: price.date,
             rate: price.amount.number,
+            explicit: true,
         });
         self.prices
             .entry(price.currency.clone())
@@ -423,6 +461,7 @@ impl PriceDatabase {
             quote: quote_currency.clone(),
             date,
             rate: price,
+            explicit: false,
         });
         self.prices
             .entry(base_currency.clone())
@@ -557,6 +596,60 @@ impl PriceDatabase {
     #[must_use]
     pub const fn as_oracle(&self) -> PriceDbOracle<'_> {
         PriceDbOracle(self)
+    }
+
+    /// A **direct** rate only — no transitive hop.
+    ///
+    /// Daytech fork: `get_price` falls back to [`Self::get_chained_price`], which
+    /// its own doc calls "a rustledger extension — beancount's price map has no
+    /// transitive lookups". beancount's `convert_amount` tries exactly one direct
+    /// lookup, then one hop through a currency the *caller* names (a position's
+    /// cost currency), and otherwise gives up. Chaining through any currency that
+    /// happens to bridge turned `21973.613 XAU` into `22,237,308 HKD` on the gold
+    /// ledger where beancount leaves the metal as metal.
+    ///
+    /// `date == None` means "latest".
+    #[must_use]
+    pub fn direct_rate(&self, base: &str, quote: &str, date: Option<NaiveDate>) -> Option<Decimal> {
+        if base == quote {
+            return Some(Decimal::ONE);
+        }
+        let inner = self.lookup_explicit.get(base)?.get(quote)?;
+        match date {
+            Some(d) => {
+                let idx = inner.partition_point(|entry| entry.0 <= d);
+                (idx > 0).then(|| inner[idx - 1].1)
+            }
+            None => inner.last().map(|entry| entry.1),
+        }
+    }
+
+    /// beancount's `convert_amount`: direct rate, else one hop through `via`,
+    /// else the amount **unchanged in its original currency**.
+    ///
+    /// `via` is the position's cost currency. beancount skips the hop when that
+    /// equals the target — which is exactly why gold held at cost in HKD does not
+    /// convert to HKD: there is no XAU→HKD price, and the only offered hop is HKD
+    /// itself.
+    #[must_use]
+    pub fn convert_like_beancount(
+        &self,
+        amount: &Amount,
+        to_currency: &str,
+        via: Option<&str>,
+        date: Option<NaiveDate>,
+    ) -> Amount {
+        if let Some(rate) = self.direct_rate(&amount.currency, to_currency, date) {
+            return Amount::new(amount.number * rate, to_currency);
+        }
+        if let Some(v) = via
+            && v != to_currency
+            && let Some(r1) = self.direct_rate(&amount.currency, v, date)
+            && let Some(r2) = self.direct_rate(v, to_currency, date)
+        {
+            return Amount::new(amount.number * r1 * r2, to_currency);
+        }
+        amount.clone()
     }
 
     /// Convert an amount using the latest available price.

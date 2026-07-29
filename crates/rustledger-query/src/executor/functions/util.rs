@@ -11,6 +11,74 @@ use crate::error::QueryError;
 use super::super::Executor;
 use super::super::types::{PostingContext, SourceLocation, Value};
 
+// Daytech fork: beancount-compatible rendering for positions and inventories,
+// used by STR. Ported from `beancount.core.position.to_string` and
+// `beancount.core.inventory.Inventory.to_string`.
+//
+// Numbers render at their natural Decimal scale -- beancount's STR goes through
+// DEFAULT_FORMATTER, NOT the inferred DisplayContext, so `4875.160000 HKD` keeps
+// the six decimals it was written with. (The bare `position` *column* does use
+// the DisplayContext and renders differently; that is a separate path.)
+
+/// beancount's `CURRENCY_ORDER` — common currencies sort first.
+fn currency_order(currency: &str) -> usize {
+    match currency {
+        "USD" => 0,
+        "EUR" => 1,
+        "JPY" => 2,
+        "CAD" => 3,
+        "GBP" => 4,
+        "AUD" => 5,
+        "NZD" => 6,
+        "CHF" => 7,
+        // NCURRENCIES + len(currency)
+        other => 8 + other.len(),
+    }
+}
+
+/// `Position.sortkey()`: `(order_units, cost_number, cost_currency, units.number)`.
+/// Note the currency itself is NOT a tiebreak beyond `order_units`, so two
+/// same-length currencies fall through to the *number* — which is why beancount
+/// renders `(4875.16 HKD, 21973.613 XAU)` in that order.
+fn position_sort_key(p: &rustledger_core::Position) -> (usize, Decimal, String, Decimal) {
+    let (cost_number, cost_currency) = p.cost.as_ref().map_or_else(
+        || (Decimal::ZERO, String::new()),
+        |c| (c.number, c.currency.to_string()),
+    );
+    (
+        currency_order(&p.units.currency),
+        cost_number,
+        cost_currency,
+        p.units.number,
+    )
+}
+
+/// `position.to_string`: `<number> <currency>` plus `{<cost>}` when held at cost.
+pub(crate) fn render_position(p: &rustledger_core::Position) -> String {
+    let mut s = format!("{} {}", p.units.number, p.units.currency);
+    if let Some(c) = &p.cost {
+        s.push_str(" {");
+        s.push_str(&format!("{} {}", c.number, c.currency));
+        if let Some(d) = c.date {
+            s.push_str(&format!(", {d}"));
+        }
+        if let Some(l) = &c.label {
+            s.push_str(&format!(", \"{l}\""));
+        }
+        s.push('}');
+    }
+    s
+}
+
+/// `Inventory.to_string`: sorted positions, comma-joined, wrapped in parens.
+/// An empty inventory renders as `()` -- not as a zero amount.
+pub(crate) fn render_inventory(inv: &rustledger_core::Inventory) -> String {
+    let mut ps: Vec<&rustledger_core::Position> = inv.positions().collect();
+    ps.sort_by(|a, b| position_sort_key(a).cmp(&position_sort_key(b)));
+    let body: Vec<String> = ps.into_iter().map(render_position).collect();
+    format!("({})", body.join(", "))
+}
+
 impl Executor<'_> {
     /// Evaluate metadata functions: `META`, `ENTRY_META`, `ANY_META`.
     ///
@@ -162,9 +230,15 @@ impl Executor<'_> {
             Value::Boolean(b) => Ok(Value::String(if *b { "TRUE" } else { "FALSE" }.to_string())),
             Value::Date(d) => Ok(Value::String(d.to_string())),
             Value::Amount(a) => Ok(Value::String(format!("{} {}", a.number, a.currency))),
+            // Daytech fork: beancount's STR accepts positions and inventories.
+            // `str(position)` / `str(balance)` / `str(sum(position))` are the ERP's
+            // bread and butter -- without these, 19 of its 31 query sites fail.
+            Value::Position(p) => Ok(Value::String(render_position(p))),
+            Value::Inventory(inv) => Ok(Value::String(render_inventory(inv))),
             Value::Null => Ok(Value::Null),
             _ => Err(QueryError::Type(
-                "STR expects a string, integer, number, boolean, date, or amount".to_string(),
+                "STR expects a string, integer, number, boolean, date, amount, position, or inventory"
+                    .to_string(),
             )),
         }
     }

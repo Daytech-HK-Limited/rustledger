@@ -333,6 +333,8 @@ impl BookingEngine {
                         // out of the validator's input to avoid double-reporting against
                         // the validator's independent lot-matching pass.
                         // (`method` is resolved above next to the NONE-method gate.)
+                        // Daytech fork: date short lots with the txn date.
+                        rustledger_core::set_current_txn_date(Some(txn.date));
                         let booking_result = inv
                             .reduce(units, Some(cost_spec), method)
                             .map_err(|e| convert_core_booking_error(e, &posting.account))?;
@@ -625,6 +627,8 @@ impl BookingEngine {
         if inv.is_booking_reduction(units, posting.cost.as_ref(), method) {
             // `reduce` only errors when the lot it would match is missing — a
             // "must book first" precondition violation.
+            // Daytech fork: date short lots with the txn date.
+            rustledger_core::set_current_txn_date(Some(date));
             inv.reduce(units, posting.cost.as_ref(), method)
                 .map_err(|e| convert_core_booking_error(e, &posting.account))?;
         } else {
@@ -709,6 +713,14 @@ impl BookingEngine {
             return Ok((interpolate(txn)?, Vec::new()));
         }
         // First book (fill in costs + compute gains), then interpolate amounts.
+        //
+        // Daytech fork: snapshot which currencies the user actually wrote, BEFORE
+        // booking. beancount runs `infer_tolerances` on the pre-booking postings,
+        // where a label-only spec like `{"GOLD"}` still carries no cost currency —
+        // so HKD counts as unseen and falls back to the `*` tolerance (0.001 -> 3
+        // dp). Booking fills that currency in, so reading it off `booked` would
+        // flip the fallback to HKD's own 0.01 and quantize to 2 dp instead.
+        crate::interpolate::set_pre_booking_currencies(txn);
         let booked = self.book(txn)?;
         let result = interpolate(&booked.transaction)?;
         Ok((result, booked.gains))

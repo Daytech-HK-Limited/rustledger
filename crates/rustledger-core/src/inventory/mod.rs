@@ -30,7 +30,7 @@ use crate::{Account, Amount, CostSpec, Currency, Position, is_subaccount_or_equa
 /// reachable via the field type but isn't promoted into the crate root.
 pub(crate) type MatchedLots = SmallVec<[Position; 1]>;
 
-mod booking;
+pub mod booking;
 
 /// Booking method determines how lots are matched when reducing positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -534,6 +534,15 @@ impl Inventory {
                 // Merge with existing position
                 debug_assert!(self.positions[idx].cost.is_none());
                 self.positions[idx].units += &position.units;
+                // Daytech fork: drop it when it nets to zero, exactly as the
+                // costed branch below does. Python's Inventory is a dict and
+                // `add_amount` does `del self[key]` on zero, so a balance that
+                // cancels out renders as `()` -- not `(0.000000 HKD)`. This is
+                // the SUM path the ERP's balance query goes through: 123 of 676
+                // accounts on the production gold ledger differed on this alone.
+                if self.positions[idx].is_empty() {
+                    self.remove_at(idx);
+                }
                 return;
             }
             // No existing position - add new one and index it
@@ -544,10 +553,46 @@ impl Inventory {
             return;
         }
 
-        // For positions with cost, just add as a new lot.
-        // This is O(1) and keeps all lots separate, matching Python beancount behavior.
-        // Lot aggregation for display purposes is handled separately in query output.
+        // For positions with cost, merge into an existing lot holding an identical
+        // (currency, cost) key. Python beancount's Inventory *is* a
+        // `dict[(units.currency, cost), Position]`, so two buys at the same cost
+        // collapse into one entry that keeps the *first* insertion's slot. Appending
+        // a separate lot instead leaves them in a different relative order, and
+        // because FIFO sorts stably by cost.date, any same-dated lot booked between
+        // the two then gets consumed in the wrong order. That is worth real money:
+        // on the gold ledger it moved 2,556 HKD of cost basis.
+        //
+        // ponytail: linear scan. These inventories are a few hundred lots and the
+        // scan is only over one account; add a (currency, cost) -> index map if a
+        // profile ever says it matters.
+        if let Some(idx) = self
+            .positions
+            .iter()
+            .position(|p| p.units.currency == position.units.currency && p.cost == position.cost)
+        {
+            self.positions[idx].units += &position.units;
+            // Python deletes the dict key when it nets to zero, so a later buy at
+            // the same cost re-inserts at the end rather than reusing this slot.
+            if self.positions[idx].is_empty() {
+                self.remove_at(idx);
+            }
+            return;
+        }
         self.positions.push_back(position);
+    }
+
+    /// Remove the lot at `idx`, rebuilding the cost-less lookup index.
+    ///
+    /// `simple_index` stores absolute indices, so every removal shifts the entries
+    /// after it; rebuilding is the cheap correct thing at these sizes.
+    fn remove_at(&mut self, idx: usize) {
+        self.positions.remove(idx);
+        self.simple_index.clear();
+        for (i, p) in self.positions.iter().enumerate() {
+            if p.cost.is_none() {
+                self.simple_index.insert(p.units.currency.clone(), i);
+            }
+        }
     }
 
     /// Reduce positions from the inventory using the specified booking method.

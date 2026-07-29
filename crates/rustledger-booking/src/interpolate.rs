@@ -88,20 +88,127 @@ pub struct InterpolationResult {
     pub residuals: HashMap<Currency, Decimal>,
 }
 
-/// Round an interpolated amount to match existing scale, but never round
-/// a non-zero residual to zero (that would leave the transaction unbalanced).
+// Daytech fork: `option "inferred_tolerance_default"` values, which upstream
+// parses for balance checks but never feeds to interpolation.
+//
+// beancount quantizes every interpolated amount through
+// `interpolate.quantize_with_tolerance`, and these ledgers set `*:0.001`, so a
+// currency with no explicit posting of its own still gets rounded -- to 3 dp,
+// since `Decimal.quantize` keys off the *exponent* of `tolerance * 2 = 0.002`.
+// Without this, an auto-filled `Expenses:Cogs` posting keeps the full precision
+// of `units x per_unit` and drifts ~0.001 per posting against beancount.
+//
+// A thread-local keeps the plumbing to one line in the loader, matching how the
+// fork already passes the transaction date into booking.
+// ponytail: process-wide, set once before booking. Fine while loading is
+// single-threaded per ledger; make it a BookingEngine field if that changes.
+thread_local! {
+    static TOLERANCE_DEFAULTS: std::cell::RefCell<HashMap<String, Decimal>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Install the `inferred_tolerance_default` map for subsequent interpolation.
+pub fn set_tolerance_defaults(defaults: HashMap<String, Decimal>) {
+    TOLERANCE_DEFAULTS.with(|t| *t.borrow_mut() = defaults);
+}
+
+// Daytech fork: the currencies the user wrote, captured before booking resolves
+// cost specs. See `set_pre_booking_currencies`.
+thread_local! {
+    static PRE_BOOKING_CURRENCIES: std::cell::RefCell<Option<std::collections::HashSet<Currency>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record `txn`'s currencies for the next [`interpolate`] call.
+///
+/// Consumed once, so a caller that skips booking still gets the currencies
+/// computed from the postings it passes in.
+pub(crate) fn set_pre_booking_currencies(txn: &Transaction) {
+    let set = currencies_of(&txn.postings);
+    PRE_BOOKING_CURRENCIES.with(|c| *c.borrow_mut() = Some(set));
+}
+
+/// Every currency named by a posting's units, cost, or price.
+fn currencies_of(
+    postings: &[rustledger_core::Spanned<rustledger_core::Posting>],
+) -> std::collections::HashSet<Currency> {
+    let mut seen = std::collections::HashSet::with_capacity(4);
+    for posting in postings {
+        let posting = &posting.value;
+        if let Some(IncompleteAmount::Complete(a)) = &posting.units {
+            seen.insert(a.currency.clone());
+        }
+        if let Some(c) = posting.cost.as_ref().and_then(|c| c.currency.clone()) {
+            seen.insert(c);
+        }
+        if let Some(IncompleteAmount::Complete(p)) =
+            posting.price.as_ref().and_then(|p| p.amount.as_ref())
+        {
+            seen.insert(p.currency.clone());
+        }
+    }
+    seen
+}
+
+/// beancount's `MAX_TOLERANCE_DIGITS` — a quantum with more significant digits
+/// than this is treated as machine-derived and does not trigger quantization.
+const MAX_TOLERANCE_DIGITS: usize = 5;
+
+/// The decimal places an interpolated amount in `currency` should be rounded to.
+///
+/// Mirrors `infer_tolerances` + `quantize_with_tolerance`:
+///   1. start from the configured tolerance — the currency's own entry if that
+///      currency appears in the transaction, else the `*` entry;
+///   2. a non-integer posting in that currency raises it to
+///      `10^-scale * tolerance_multiplier`, taking the **max** (so a coarse
+///      configured default can still win over a finely-written amount);
+///   3. quantize to the exponent of `tolerance * 2`, unless that quantum has too
+///      many significant digits to look user-specified.
+fn effective_scale(
+    currency: &str,
+    seen: &std::collections::HashSet<Currency>,
+    max_scale_by_currency: &HashMap<Currency, u32>,
+) -> Option<u32> {
+    let mut tolerance = TOLERANCE_DEFAULTS.with(|t| {
+        let t = t.borrow();
+        if seen.contains(currency) {
+            t.get(currency).or_else(|| t.get("*")).copied()
+        } else {
+            t.get("*").copied()
+        }
+    });
+
+    // tolerance_multiplier is 0.5 and not configurable in these ledgers.
+    if let Some(&scale) = max_scale_by_currency.get(currency) {
+        let from_scale = Decimal::new(5, scale + 1); // 10^-scale * 0.5
+        tolerance = Some(match tolerance {
+            Some(t) if t > from_scale => t,
+            _ => from_scale,
+        });
+    }
+
+    let quantum = (tolerance? * Decimal::TWO).normalize();
+    if quantum.mantissa().unsigned_abs().to_string().len() >= MAX_TOLERANCE_DIGITS {
+        return None;
+    }
+    Some(quantum.scale())
+}
+
+/// Round an interpolated amount to the quantum implied by the currency's
+/// tolerance.
+///
+/// Daytech fork: rounding a small non-zero residual all the way to zero is
+/// CORRECT here. Upstream preserved full precision in that case to avoid
+/// leaving the transaction unbalanced, but beancount's
+/// `quantize_with_tolerance` has no such guard -- a residual that rounds away
+/// is by definition within tolerance, which is exactly when beancount accepts
+/// it. Keeping it produced postings like `-0.0048 HKD` where beancount books
+/// `-0.00 HKD`.
 fn round_interpolated(residual: Decimal, existing_scale: Option<u32>) -> Decimal {
     let interpolated = -residual;
-    if let Some(scale) = existing_scale {
-        let rounded = interpolated.round_dp(scale);
-        // If rounding would make non-zero residual into zero, preserve precision
-        if rounded.is_zero() && !residual.is_zero() {
-            interpolated
-        } else {
-            rounded
-        }
-    } else {
-        interpolated
+    match existing_scale {
+        Some(scale) => interpolated.round_dp(scale),
+        None => interpolated,
     }
 }
 
@@ -195,6 +302,14 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
     //   per_unit precision.
     let mut max_scale_by_currency: HashMap<Currency, u32> = HashMap::with_capacity(4);
 
+    // Daytech fork: the currencies `infer_tolerances` considers "seen" — a
+    // configured per-currency tolerance only applies to those, everything else
+    // falls back to the `*` default. Prefer the pre-booking snapshot, since
+    // booking fills in cost currencies the user never wrote.
+    let seen_currencies = PRE_BOOKING_CURRENCIES
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_else(|| currencies_of(&transaction.postings));
+
     // Track per-currency count of postings whose weight contribution is unknown
     // because the cost spec is empty (e.g., `{}`) and resolution is deferred to
     // the booking pass (lot matching). Each such posting is one unknown for
@@ -213,6 +328,13 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
     // Each is solved post-loop, but only when it is the SOLE unknown in its
     // cost currency group (else the group already errored on the count rule).
     let mut inferable_cost: Vec<(usize, Currency, Decimal)> = Vec::new();
+
+    // Daytech fork: indices filled with zero because the currency's residual was
+    // ALREADY zero (nothing to interpolate). beancount creates no posting in that
+    // case, but does keep one when a non-zero residual rounds to zero -- see the
+    // prune step at the end.
+    let mut zeroed_from_zero_residual: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
 
     for (i, posting) in transaction.postings.iter().enumerate() {
         match &posting.units {
@@ -545,7 +667,7 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
         let residual = residuals.get(&currency).copied().unwrap_or(Decimal::ZERO);
 
         let interpolated =
-            round_interpolated(residual, max_scale_by_currency.get(&currency).copied());
+            round_interpolated(residual, effective_scale(&currency, &seen_currencies, &max_scale_by_currency));
 
         result.postings[idx].units = Some(IncompleteAmount::Complete(Amount::new(
             interpolated,
@@ -577,7 +699,7 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
             let (first_currency, first_residual) = &non_zero_residuals[0];
             let interpolated = round_interpolated(
                 *first_residual,
-                max_scale_by_currency.get(first_currency).copied(),
+                effective_scale(first_currency, &seen_currencies, &max_scale_by_currency),
             );
             result.postings[idx].units = Some(IncompleteAmount::Complete(Amount::new(
                 interpolated,
@@ -590,7 +712,7 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
             for (currency, residual) in non_zero_residuals.iter().skip(1) {
                 let mut new_posting = original_posting.clone();
                 let interpolated =
-                    round_interpolated(*residual, max_scale_by_currency.get(currency).copied());
+                    round_interpolated(*residual, effective_scale(currency, &seen_currencies, &max_scale_by_currency));
                 new_posting.units = Some(IncompleteAmount::Complete(Amount::new(
                     interpolated,
                     currency,
@@ -617,7 +739,7 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
                 if i < non_zero_residuals.len() {
                     let (currency, residual) = &non_zero_residuals[i];
                     let interpolated =
-                        round_interpolated(*residual, max_scale_by_currency.get(currency).copied());
+                        round_interpolated(*residual, effective_scale(currency, &seen_currencies, &max_scale_by_currency));
                     result.postings[*idx].units = Some(IncompleteAmount::Complete(Amount::new(
                         interpolated,
                         currency,
@@ -630,6 +752,7 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
                     result.postings[*idx].units =
                         Some(IncompleteAmount::Complete(Amount::zero(currency)));
                     filled_indices.push(*idx);
+                    zeroed_from_zero_residual.insert(*idx);
                 } else if let Some(currency) = get_inferred_currency(&mut inferred_cost_currency) {
                     // No residuals but we can infer currency from cost basis
                     // This handles balanced cost-basis transactions like:
@@ -639,6 +762,7 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
                     result.postings[*idx].units =
                         Some(IncompleteAmount::Complete(Amount::zero(&currency)));
                     filled_indices.push(*idx);
+                    zeroed_from_zero_residual.insert(*idx);
                 } else {
                     // No residuals and cannot infer currency
                     return Err(InterpolationError::CannotInferCurrency {
@@ -665,17 +789,24 @@ pub fn interpolate(transaction: &Transaction) -> Result<InterpolationResult, Int
     // catches them. Tested by `test_zero_interpolated_posting_keeps_e1001_*`
     // in `rustledger-loader`.
     //
+    // Daytech fork: prune only postings whose residual was *exactly* zero.
+    //
+    // The premise above ("Python drops these too") is half right. beancount
+    // creates no posting when a currency's residual is already zero — there is
+    // nothing to interpolate — but it DOES keep a `0.00` posting when a non-zero
+    // residual quantizes away, because the posting was genuinely filled and only
+    // then rounded. `SELECT date, account, number WHERE account ~ 'FXGainOrLoss'`
+    // returns a `0.00 HKD` row from bean-query for a month-end FX revaluation
+    // (residual -0.0000028 -> 0.00), and none for a transaction that already
+    // balanced.
+    //
+    // Pruning both ways loses the first kind; pruning neither invents the second.
+    // `zeroed_from_zero_residual` records which is which at fill time.
+    //
     // Iterate in reverse so indices stay valid as we remove.
     let mut indices_to_remove: Vec<usize> = filled_indices
         .iter()
-        .filter(|&&idx| {
-            result.postings.get(idx).is_some_and(|p| {
-                p.units
-                    .as_ref()
-                    .and_then(|u| u.as_amount())
-                    .is_some_and(|a| a.number.is_zero())
-            })
-        })
+        .filter(|idx| zeroed_from_zero_residual.contains(idx))
         .copied()
         .collect();
     indices_to_remove.sort_unstable_by(|a, b| b.cmp(a));

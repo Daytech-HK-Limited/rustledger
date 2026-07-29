@@ -1255,60 +1255,42 @@ impl<'a> Executor<'a> {
                     None
                 };
 
-                // Helper closure to convert an amount
-                let convert_amount = |amt: &Amount| -> Option<Amount> {
-                    if let Some(d) = date {
-                        self.price_db.convert(amt, &target_currency, d)
-                    } else {
-                        self.price_db.convert_latest(amt, &target_currency)
-                    }
+                // Daytech fork: beancount's `convert_amount` semantics.
+                //
+                // Converts UNITS through the price map -- never at cost -- and
+                // returns the units unchanged when no price exists. `via` is the
+                // position's cost currency, the single hop beancount allows, and
+                // it is skipped when it equals the target.
+                let convert_units = |amt: &Amount, via: Option<&str>| -> Amount {
+                    self.price_db
+                        .convert_like_beancount(amt, &target_currency, via, date)
                 };
+                let cost_ccy = |p: &Position| p.cost.as_ref().map(|c| c.currency.to_string());
 
                 match &args[0] {
-                    Value::Position(p) => {
-                        if p.units.currency == target_currency {
-                            Ok(Value::Amount(p.units.clone()))
-                        } else if let Some(converted) = convert_amount(&p.units) {
-                            Ok(Value::Amount(converted))
-                        } else {
-                            Ok(Value::Amount(p.units.clone()))
-                        }
-                    }
-                    Value::Amount(a) => {
-                        if a.currency == target_currency {
-                            Ok(Value::Amount(a.clone()))
-                        } else if let Some(converted) = convert_amount(a) {
-                            Ok(Value::Amount(converted))
-                        } else {
-                            Ok(Value::Amount(a.clone()))
-                        }
-                    }
+                    // convert(Position, ...) -> Amount  (beanquery signature)
+                    Value::Position(p) => Ok(Value::Amount(convert_units(
+                        &p.units,
+                        cost_ccy(p).as_deref(),
+                    ))),
+                    Value::Amount(a) => Ok(Value::Amount(convert_units(a, None))),
+                    // convert(Inventory, ...) -> Inventory, ALWAYS.
+                    //
+                    // Upstream collapsed a single target-currency position to an
+                    // Amount and an empty inventory to `0 <target>`. beanquery's
+                    // signature is `[Inventory, str] -> Inventory` with no such
+                    // special cases: `inv.reduce(convert.convert_position, ...)`.
+                    // The collapse dropped the parentheses the ERP's parser strips
+                    // and turned an empty balance into a fake zero.
                     Value::Inventory(inv) => {
-                        // Convert each position, keeping originals when no conversion available
-                        // (matches Python beancount behavior)
                         let mut result = Inventory::default();
                         for pos in inv.positions() {
-                            if pos.units.currency == target_currency {
-                                result.add(Position::simple(pos.units.clone()));
-                            } else if let Some(converted) = convert_amount(&pos.units) {
-                                result.add(Position::simple(converted));
-                            } else {
-                                // No conversion available - keep original (Python beancount behavior)
-                                result.add(Position::simple(pos.units.clone()));
-                            }
+                            result.add(Position::simple(convert_units(
+                                &pos.units,
+                                cost_ccy(pos).as_deref(),
+                            )));
                         }
-                        // If result has single currency matching target, return as Amount
-                        // If result is empty, return zero in target currency (issue #586)
-                        let positions: Vec<&Position> = result.positions().collect();
-                        if positions.is_empty() {
-                            Ok(Value::Amount(Amount::new(Decimal::ZERO, &target_currency)))
-                        } else if positions.len() == 1
-                            && positions[0].units.currency == target_currency
-                        {
-                            Ok(Value::Amount(positions[0].units.clone()))
-                        } else {
-                            Ok(Value::Inventory(Box::new(result)))
-                        }
+                        Ok(Value::Inventory(Box::new(result)))
                     }
                     Value::Number(n) => Ok(Value::Amount(Amount::new(*n, &target_currency))),
                     Value::String(s) => {
@@ -1325,15 +1307,7 @@ impl<'a> Executor<'a> {
                                 "CONVERT: first argument {e} (e.g. \"100 USD\")"
                             ))
                         })?;
-                        if amt.currency == target_currency {
-                            Ok(Value::Amount(amt))
-                        } else if let Some(converted) = convert_amount(&amt) {
-                            Ok(Value::Amount(converted))
-                        } else {
-                            // Match the `Value::Amount` arm: no price available
-                            // → return original unchanged.
-                            Ok(Value::Amount(amt))
-                        }
+                        Ok(Value::Amount(convert_units(&amt, None)))
                     }
                     Value::Null => {
                         // For null values (e.g., empty sum), return zero in target currency

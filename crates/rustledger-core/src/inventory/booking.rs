@@ -12,6 +12,64 @@ use smallvec::{SmallVec, smallvec};
 use super::{BookingError, BookingMethod, BookingResult, Inventory, MatchedLots};
 use crate::{Amount, Cost, CostSpec, Currency, Position};
 
+thread_local! {
+    /// Daytech fork: date of the transaction currently being booked.
+    ///
+    /// The beancount fork dates a synthesised short lot with the transaction
+    /// date when the cost spec omits one (`booking_method.py`:
+    /// `cost_date = original_cost.date if ... else entry.date`). Lot identity is
+    /// `(cost, date)`, so a dateless short never nets against a later dated long
+    /// and both stay on the books — which is exactly the divergence we saw.
+    ///
+    /// Threading the date through every `reduce_*` signature would touch ~70 call
+    /// sites including tests. This is a deliberate shortcut: the booking engine
+    /// sets it immediately before each reduce. Single-threaded per ledger load.
+    static CURRENT_TXN_DATE: std::cell::Cell<Option<crate::NaiveDate>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Daytech fork: record the transaction date for short-lot dating.
+pub fn set_current_txn_date(date: Option<crate::NaiveDate>) {
+    CURRENT_TXN_DATE.with(|d| d.set(date));
+}
+
+/// Daytech fork: build the short lot that covers the part of a reduction the
+/// available lots cannot.
+///
+/// Upstream rustledger (and upstream beancount) reject a reduction larger than
+/// the inventory holds. Our beancount fork instead opens a negative lot for the
+/// shortfall — see `beancount/parser/booking_method.py` — because the gold desk
+/// legitimately runs short (unfixed sales), and rejecting those transactions
+/// makes the ledger unloadable.
+///
+/// Returns `None` when the spec carries no explicit per-unit cost and currency.
+/// We cannot price a lot we were not given a price for, so the caller keeps
+/// erroring — the same bail-out the beancount fork takes.
+///
+/// The lot is dated from the spec, falling back to the transaction date via
+/// [`CURRENT_TXN_DATE`] — matching the beancount fork, and required for the
+/// short to net against later longs booked on the same cost+date.
+fn short_lot(units: &Amount, spec: &CostSpec, shortfall: Decimal) -> Option<Position> {
+    let number = spec.number.as_ref()?.per_unit()?;
+    let currency = spec.currency.clone()?;
+    let date = spec.date.or_else(|| CURRENT_TXN_DATE.with(std::cell::Cell::get));
+    // A reduction of negative units leaves a negative remainder, and vice versa.
+    let signed = if units.number.is_sign_negative() {
+        -shortfall
+    } else {
+        shortfall
+    };
+    Some(Position {
+        units: Amount::new(signed, units.currency.clone()),
+        cost: Some(Cost {
+            number,
+            currency,
+            date,
+            label: spec.label.clone(),
+        }),
+    })
+}
+
 /// Compute weighted-average cost from a set of positions.
 ///
 /// Returns `(avg_cost_per_unit, cost_currency)` or `None` if no positions have cost info.
@@ -309,12 +367,22 @@ impl Inventory {
             .iter()
             .map(|&i| self.positions[i].units.number.abs())
             .sum();
+        // Daytech fork: go short rather than reject. See `short_lot`.
+        let mut short = None;
         if available < remaining {
-            return Err(BookingError::InsufficientUnits {
-                currency: units.currency.clone(),
-                requested: remaining,
-                available,
-            });
+            match short_lot(units, spec, remaining - available) {
+                Some(lot) => {
+                    short = Some(lot);
+                    remaining = available;
+                }
+                None => {
+                    return Err(BookingError::InsufficientUnits {
+                        currency: units.currency.clone(),
+                        requested: remaining,
+                        available,
+                    });
+                }
+            }
         }
 
         for idx in indices {
@@ -350,6 +418,29 @@ impl Inventory {
             self.positions[idx] = new_pos;
 
             remaining -= take;
+        }
+
+        // Daytech fork: book the uncovered remainder as a short lot.
+        //
+        // Two different sign conventions are in play and both matter:
+        //   - `self.positions` gets the lot as held, i.e. NEGATIVE for a sell
+        //     that overshoots, so the account genuinely goes short.
+        //   - `matched` gets it POSITIVE, matching the drained lots above
+        //     (`pos.split(take * pos.units.number.signum())` yields positive
+        //     units for a long being sold). `matched` drives posting expansion
+        //     in `rustledger-booking::book`; omitting the short shrinks the
+        //     emitted posting by the shortfall, and pushing it negative flips
+        //     the sign and inflates the account instead.
+        if let Some(lot) = short {
+            if let Some(cost) = &lot.cost {
+                cost_basis += lot.units.number.abs() * cost.number;
+                cost_currency = Some(cost.currency.clone());
+            }
+            matched.push(Position {
+                units: Amount::new(-lot.units.number, lot.units.currency.clone()),
+                cost: lot.cost.clone(),
+            });
+            self.positions.push_back(lot);
         }
 
         // Clean up empty positions
@@ -420,12 +511,22 @@ impl Inventory {
             .iter()
             .map(|&i| self.positions[i].units.number.abs())
             .sum();
+        // Daytech fork: go short rather than reject. See `short_lot`.
+        let mut short = None;
         if available < remaining {
-            return Err(BookingError::InsufficientUnits {
-                currency: units.currency.clone(),
-                requested: remaining,
-                available,
-            });
+            match short_lot(units, spec, remaining - available) {
+                Some(lot) => {
+                    short = Some(lot);
+                    remaining = available;
+                }
+                None => {
+                    return Err(BookingError::InsufficientUnits {
+                        currency: units.currency.clone(),
+                        requested: remaining,
+                        available,
+                    });
+                }
+            }
         }
 
         for idx in indices {
@@ -455,6 +556,29 @@ impl Inventory {
             pos.units.number += reduction;
 
             remaining -= take;
+        }
+
+        // Daytech fork: book the uncovered remainder as a short lot.
+        //
+        // Two different sign conventions are in play and both matter:
+        //   - `self.positions` gets the lot as held, i.e. NEGATIVE for a sell
+        //     that overshoots, so the account genuinely goes short.
+        //   - `matched` gets it POSITIVE, matching the drained lots above
+        //     (`pos.split(take * pos.units.number.signum())` yields positive
+        //     units for a long being sold). `matched` drives posting expansion
+        //     in `rustledger-booking::book`; omitting the short shrinks the
+        //     emitted posting by the shortfall, and pushing it negative flips
+        //     the sign and inflates the account instead.
+        if let Some(lot) = short {
+            if let Some(cost) = &lot.cost {
+                cost_basis += lot.units.number.abs() * cost.number;
+                cost_currency = Some(cost.currency.clone());
+            }
+            matched.push(Position {
+                units: Amount::new(-lot.units.number, lot.units.currency.clone()),
+                cost: lot.cost.clone(),
+            });
+            self.positions.push_back(lot);
         }
 
         // Clean up empty positions
@@ -730,16 +854,13 @@ impl Inventory {
         units: &Amount,
     ) -> Result<BookingResult, BookingError> {
         let pos = &self.positions[idx];
-        let available = pos.units.number.abs();
         let requested = units.number.abs();
 
-        if requested > available {
-            return Err(BookingError::InsufficientUnits {
-                currency: units.currency.clone(),
-                requested,
-                available,
-            });
-        }
+        // Daytech fork: upstream rejects `requested > available` here. We let the
+        // lot go short instead — see `short_lot` for why. No special case is
+        // needed: `new_units = pos.units.number + units.number` below already
+        // crosses zero on its own (100 long minus 500 sold => -400), and the
+        // lot's own cost prices the short, which is the cost the spec matched on.
 
         // Calculate cost basis
         let cost_basis = pos.cost.as_ref().map(|c| c.total_cost(requested));

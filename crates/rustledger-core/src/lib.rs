@@ -87,6 +87,7 @@ pub use identifiers::{
 };
 pub use implicit_prices::extract_per_unit_price;
 pub use intern::{InternedStr, StringInterner};
+pub use inventory::booking::set_current_txn_date;
 pub use inventory::{
     AccountedBookingError, BookingError, BookingMethod, BookingResult, Inventory, ReductionScope,
     sum_account_and_subaccounts,

@@ -638,7 +638,20 @@ pub fn sort_directives(directives: &mut [Directive]) {
 /// directly). Change a booking-order tiebreak here only.
 #[must_use]
 pub fn booking_sort_key(d: &Directive) -> (NaiveDate, DirectivePriority, bool) {
-    (d.date(), d.priority(), d.has_cost_reduction())
+    // Daytech fork: do NOT hoist augmentations ahead of reductions.
+    //
+    // Upstream's third key element (`has_cost_reduction`) books every buy on a
+    // date before any sell on that date, so a lot always exists when matched.
+    // beancount doesn't do that -- `data.entry_sortkey` is `(date, type, lineno)`
+    // and it books strictly in file order within a date. On these ledgers, where
+    // buys and sells of the same commodity interleave all day, the hoist hands
+    // FIFO a different set of available lots and so a different cost basis: 33 of
+    // 160 dates on the gold ledger disagreed with beancount, by up to 6,000 HKD
+    // on a single day.
+    //
+    // The tradeoff is upstream's, taken deliberately: a same-day sell written
+    // before its buy now fails to match, exactly as it does in beancount.
+    (d.date(), d.priority(), false)
 }
 
 /// A transaction directive.

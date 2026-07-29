@@ -469,6 +469,8 @@ pub fn process_inventory_reduction(
         return;
     }
 
+    // Daytech fork: date short lots with the txn date.
+    rustledger_core::set_current_txn_date(Some(txn.date));
     match inv.reduce(units, posting.cost.as_ref(), booking_method) {
         Ok(_) => {}
         Err(err) => {

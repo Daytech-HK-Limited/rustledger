@@ -1480,6 +1480,7 @@ pub(super) fn cost_spec_from_tokens(tokens: impl Iterator<Item = impl TokenView>
     let mut merge = false;
     let mut merge_decided = false;
     let mut past_opener = false;
+    let mut minus = false; // Daytech fork: sign for the next NUMBER token
     for t in tokens {
         let kind = t.kind();
         // Merge-flag machine (runs alongside the value machine below; openers
@@ -1500,20 +1501,30 @@ pub(super) fn cost_spec_from_tokens(tokens: impl Iterator<Item = impl TokenView>
         match kind {
             K::L_DOUBLE_BRACE => is_total = true,
             K::NUMBER => {
+                // Daytech fork: apply a preceding MINUS. The lexer emits the sign
+                // as its own token, and dropping it silently turned
+                // `{-0.00010892 HKD}` into a POSITIVE cost -- the posting's weight
+                // came out `+1.0892` instead of `-1.0892`, so a transaction that
+                // balances in beancount failed here with a residual of exactly
+                // twice the cost. beancount flags a negative cost but still books
+                // the signed value. `green.rs` already does this for amounts.
+                let parsed = parse_decimal_token(t.text()).map(|d| if minus { -d } else { d });
+                minus = false;
                 if past_hash {
                     if post_hash_total.is_none() {
-                        post_hash_total = parse_decimal_token(t.text());
+                        post_hash_total = parsed;
                     }
                 } else {
                     if pre_hash.is_none() {
-                        pre_hash = parse_decimal_token(t.text());
+                        pre_hash = parsed;
                     }
                     if !seen_number {
                         seen_number = true;
-                        first_number = parse_decimal_token(t.text());
+                        first_number = parsed;
                     }
                 }
             }
+            K::MINUS => minus = true,
             K::HASH | K::L_BRACE_HASH => past_hash = true,
             K::CURRENCY if currency.is_none() => currency = Some(Currency::new(t.text())),
             K::DATE if !date_seen => {
