@@ -10369,3 +10369,92 @@ fn test_pivot_by_first_column_is_the_row_key() {
         );
     }
 }
+
+#[test]
+fn test_postings_table_column_gate_keeps_metadata_reachable() {
+    // The #postings table is materialized in full before the query runs, so its
+    // expensive columns are built only when the query reads them. `META('x')`
+    // resolves to the hidden `_posting_meta` column at execution time WITHOUT
+    // naming it as a column, so a gate keyed on column references alone would
+    // hand these queries a Null. Guards `query_calls_meta_function`.
+    let mut food = Posting::new("Expenses:Food", Amount::new(dec!(10), "USD"));
+    food.meta.insert(
+        "rating".to_string(),
+        rustledger_core::MetaValue::String("good".to_string()),
+    );
+    let directives = vec![
+        Directive::Open(Open::new(date(2022, 1, 1), "Assets:Cash")),
+        Directive::Open(Open::new(date(2022, 1, 1), "Expenses:Food")),
+        Directive::Transaction({
+            let mut txn = Transaction::new(date(2022, 4, 1), "Lunch");
+            txn.meta.insert(
+                "category".to_string(),
+                rustledger_core::MetaValue::String("dining".to_string()),
+            );
+            txn.postings = vec![
+                rustledger_core::Spanned::synthesized(food),
+                rustledger_core::Spanned::synthesized(Posting::new(
+                    "Assets:Cash",
+                    Amount::new(dec!(-10), "USD"),
+                )),
+            ];
+            txn
+        }),
+    ];
+
+    // Each of these reaches metadata only through a function call.
+    for (query, want) in [
+        ("SELECT meta('rating') FROM #postings", "good"),
+        ("SELECT any_meta('rating') FROM #postings", "good"),
+        ("SELECT entry_meta('category') FROM #postings", "dining"),
+        // Nested inside another call, so the walk must recurse.
+        ("SELECT length(meta('rating')) FROM #postings", ""),
+    ] {
+        let result = execute_query(query, &directives);
+        assert_eq!(result.rows.len(), 2, "{query}");
+        if !want.is_empty() {
+            assert_eq!(
+                result.rows[0][0],
+                Value::String(want.to_string()),
+                "{query} must not be gated out"
+            );
+        } else {
+            assert_ne!(result.rows[0][0], Value::Null, "{query} must not be Null");
+        }
+    }
+
+    // Metadata referenced only from WHERE — never in a target.
+    let result = execute_query(
+        "SELECT account FROM #postings WHERE meta('rating') = 'good'",
+        &directives,
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::String("Expenses:Food".to_string()));
+
+    // `entry` is outside wildcard expansion, so it only ever arrives by name —
+    // but then it must be real, not gated away.
+    let result = execute_query("SELECT entry FROM #postings", &directives);
+    assert_eq!(result.rows.len(), 2);
+    assert_ne!(result.rows[0][0], Value::Null, "entry must not be gated out");
+
+    // `SELECT *` names no column but expands to every visible one, including
+    // gated ones — the wildcard must defeat those gates.
+    let result = execute_query("SELECT * FROM #postings", &directives);
+    assert_eq!(result.rows.len(), 2);
+    for col in ["balance", "account_balance", "meta"] {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(col))
+            .unwrap_or_else(|| panic!("#postings must expose {col}"));
+        assert_ne!(
+            result.rows[0][idx],
+            Value::Null,
+            "SELECT * must populate {col}"
+        );
+    }
+
+    // And the case the gate exists for: reading nothing must still count right.
+    let result = execute_query("SELECT count(*) FROM #postings", &directives);
+    assert_eq!(result.rows[0][0], Value::Integer(2));
+}

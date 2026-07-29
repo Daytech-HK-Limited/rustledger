@@ -1927,7 +1927,15 @@ impl<'a> Executor<'a> {
     /// compatibility (issue #632).
     ///
     /// Returns `None` if the table name is not a recognized built-in table.
-    pub(super) fn get_builtin_table(&self, table_name: &str) -> Option<Table> {
+    ///
+    /// `query` is the query being served, used only by `#postings` to decide
+    /// whether the expensive `balance` / `account_balance` running-inventory
+    /// columns have to be materialized at all.
+    pub(super) fn get_builtin_table(
+        &self,
+        table_name: &str,
+        query: &SelectQuery,
+    ) -> Option<Table> {
         // Normalize table name: strip # prefix if present for Python beancount compatibility.
         // Both "#transactions" (rustledger) and "transactions" (beancount) work.
         // Using strip_prefix avoids allocation in the common case.
@@ -1944,7 +1952,7 @@ impl<'a> Executor<'a> {
             "ACCOUNTS" => Some(self.build_accounts_table()),
             "TRANSACTIONS" => Some(self.build_transactions_table()),
             "ENTRIES" => Some(self.build_entries_table()),
-            "POSTINGS" => Some(self.build_postings_table()),
+            "POSTINGS" => Some(self.build_postings_table(query)),
             _ => None,
         }
     }
@@ -1996,6 +2004,84 @@ fn expr_references_column(expr: &Expr, name: &str) -> bool {
         Expr::Set(items) => items.iter().any(|i| expr_references_column(i, name)),
         Expr::Wildcard | Expr::Literal(_) => false,
     }
+}
+
+/// Return `true` if `expr` calls one of the metadata functions.
+///
+/// `META('x')` and friends read the hidden `_posting_meta` / `_entry_meta`
+/// columns at execution time (see `eval_meta_on_table_row`) without ever
+/// naming them as columns, so [`expr_references_column`] cannot see them. The
+/// name set is exactly the dispatch guard in `execution.rs` — keep them in
+/// step, or `#postings` will hand `META()` a Null it should never see.
+fn expr_calls_meta_function(expr: &Expr) -> bool {
+    let is_meta = |name: &str| {
+        matches!(
+            name.to_uppercase().as_str(),
+            "META" | "ENTRY_META" | "ANY_META" | "POSTING_META"
+        )
+    };
+    match expr {
+        Expr::Function(call) => {
+            is_meta(&call.name) || call.args.iter().any(expr_calls_meta_function)
+        }
+        Expr::Window(call) => {
+            is_meta(&call.name)
+                || call.args.iter().any(expr_calls_meta_function)
+                || call
+                    .over
+                    .partition_by
+                    .as_ref()
+                    .is_some_and(|ps| ps.iter().any(expr_calls_meta_function))
+                || call
+                    .over
+                    .order_by
+                    .as_ref()
+                    .is_some_and(|os| os.iter().any(|o| expr_calls_meta_function(&o.expr)))
+        }
+        Expr::Attribute { operand, .. } | Expr::Subscript { operand, .. } => {
+            expr_calls_meta_function(operand)
+        }
+        Expr::BinaryOp(op) => {
+            expr_calls_meta_function(&op.left) || expr_calls_meta_function(&op.right)
+        }
+        Expr::UnaryOp(op) => expr_calls_meta_function(&op.operand),
+        Expr::Paren(inner) => expr_calls_meta_function(inner),
+        Expr::Between { value, low, high } => {
+            expr_calls_meta_function(value)
+                || expr_calls_meta_function(low)
+                || expr_calls_meta_function(high)
+        }
+        Expr::Set(items) => items.iter().any(expr_calls_meta_function),
+        Expr::Column(_) | Expr::Wildcard | Expr::Literal(_) => false,
+    }
+}
+
+/// Return `true` if any part of a `SelectQuery` calls a metadata function.
+/// Same clause coverage as [`query_references_column`].
+pub(super) fn query_calls_meta_function(query: &SelectQuery) -> bool {
+    query.targets.iter().any(|t| expr_calls_meta_function(&t.expr))
+        || query
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_calls_meta_function)
+        || query
+            .group_by
+            .as_ref()
+            .is_some_and(|g| g.iter().any(expr_calls_meta_function))
+        || query.having.as_ref().is_some_and(expr_calls_meta_function)
+        || query
+            .pivot_by
+            .as_ref()
+            .is_some_and(|p| p.iter().any(expr_calls_meta_function))
+        || query
+            .order_by
+            .as_ref()
+            .is_some_and(|o| o.iter().any(|s| expr_calls_meta_function(&s.expr)))
+        || query
+            .from
+            .as_ref()
+            .and_then(|f| f.filter.as_ref())
+            .is_some_and(expr_calls_meta_function)
 }
 
 /// Return `true` if any part of a `SelectQuery` references the given

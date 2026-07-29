@@ -7,7 +7,8 @@
 //! from the directives at construction).
 
 use super::types::{SourceLocation, Table, Value};
-use super::{Executor, compute_posting_weight};
+use super::{Executor, compute_posting_weight, query_calls_meta_function, query_references_column};
+use crate::ast::{Expr, SelectQuery};
 use rustc_hash::FxHashMap;
 use rustledger_core::{Amount, Directive, Position};
 
@@ -546,7 +547,39 @@ impl Executor<'_> {
     /// Build the #postings table from transaction postings.
     ///
     /// Column schema matches Python beancount's `postings` table for compatibility.
-    pub(super) fn build_postings_table(&self) -> Table {
+    ///
+    /// The expensive columns are built only when `query` actually reads them.
+    /// This table is materialized in full before the query runs, so every
+    /// column is paid for on every row — 78k postings on a real ledger. The
+    /// default (no-`FROM`) `SELECT` path has always gated its running balances
+    /// this way; this path hardcoded everything on, so
+    /// `SELECT count(*) FROM postings` — which reads no column at all — cost
+    /// +1.5 GB resident and ~2s.
+    ///
+    /// Gated: `balance` / `account_balance` (cumulative `Inventory` clones per
+    /// posting, the runaway cost in #1080), `entry` (a structured object cloned
+    /// per posting) and the three metadata columns.
+    ///
+    /// An ungated column stays `Value::Null`, which nothing reads — with one
+    /// trap: `META('x')` resolves to the hidden `_posting_meta` column at
+    /// execution time without ever naming it, so the metadata gate has to look
+    /// for the *function*, not just the column. See `query_calls_meta_function`.
+    pub(super) fn build_postings_table(&self, query: &SelectQuery) -> Table {
+        // `SELECT *` expands to every column of the table, so a wildcard target
+        // reads all of them even though no Expr::Column names them.
+        let wildcard = query
+            .targets
+            .iter()
+            .any(|t| matches!(t.expr, Expr::Wildcard));
+        let needs = |name: &str| wildcard || query_references_column(query, name);
+        let needs_balance = needs("balance");
+        let needs_account_balance = needs("account_balance");
+        let needs_entry = needs("entry");
+        let needs_meta = needs("meta")
+            || needs("_entry_meta")
+            || needs("_posting_meta")
+            || query_calls_meta_function(query);
+
         let columns = vec![
             // Entry-level columns
             "type".to_string(),
@@ -594,19 +627,38 @@ impl Executor<'_> {
 
         // Single posting-source scan, shared with the default `SELECT` path
         // ([`Self::collect_postings`]): every posting in directive order, with no
-        // FROM/WHERE filter and both running balances tracked. With no filter
-        // there are no predicates to evaluate, so the scan is infallible here —
-        // assert that invariant rather than silently emitting an empty table.
+        // FROM/WHERE filter, tracking only the running balances this query
+        // actually reads. With no filter there are no predicates to evaluate, so
+        // the scan is infallible here — assert that invariant rather than
+        // silently emitting an empty table.
         let contexts = self
-            .scan_postings(None, None, true, true, false, true)
+            .scan_postings(
+                None,
+                None,
+                needs_balance,
+                needs_account_balance,
+                false,
+                true,
+            )
             .expect("scan_postings(None, None, ..) evaluates no predicates, so it cannot fail")
             .postings;
 
-        // Entry objects are per-TRANSACTION; postings of one transaction are
-        // contiguous in the scan, so memoize the last built object instead of
-        // rebuilding (strings, tags/links vectors, full meta conversion) for
-        // every posting (#1800 review).
-        let mut last_entry: Option<(usize, Value)> = None;
+        // Everything here is per-TRANSACTION, but the loop below runs per
+        // POSTING. Postings of one transaction are contiguous in the scan, so
+        // build these once and reuse them across the transaction's postings.
+        // `entry` was already memoized this way (#1800 review); `tags`, `links`,
+        // `description` and especially `all_accounts` were not — the last one
+        // built a HashSet and sorted it once per posting, i.e. O(postings²) per
+        // transaction, for a value that is identical across them.
+        struct TxnMemo {
+            dir_idx: usize,
+            entry: Value,
+            tags: Vec<String>,
+            links: Vec<String>,
+            all_accounts: Vec<String>,
+            description: String,
+        }
+        let mut memo: Option<TxnMemo> = None;
 
         for ctx in contexts {
             let txn = ctx.transaction;
@@ -619,31 +671,39 @@ impl Executor<'_> {
             // Transaction-level location — the per-posting fallback below.
             let source_loc = self.get_source_location(dir_idx);
 
-            let entry_val = match &last_entry {
-                Some((idx, value)) if *idx == dir_idx => value.clone(),
-                _ => {
-                    let value = Self::entry_object(txn, source_loc);
-                    last_entry = Some((dir_idx, value.clone()));
-                    value
-                }
-            };
-
-            let tags: Vec<String> = txn.tags.iter().map(ToString::to_string).collect();
-            let links: Vec<String> = txn.links.iter().map(ToString::to_string).collect();
-
-            let mut all_accounts: Vec<String> = txn
-                .postings
-                .iter()
-                .map(|p| p.account.to_string())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            all_accounts.sort();
-
-            let description = match &txn.payee {
-                Some(payee) => format!("{} | {}", payee, txn.narration),
-                None => txn.narration.to_string(),
-            };
+            if memo.as_ref().is_none_or(|m| m.dir_idx != dir_idx) {
+                let mut all_accounts: Vec<String> = txn
+                    .postings
+                    .iter()
+                    .map(|p| p.account.to_string())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                all_accounts.sort();
+                memo = Some(TxnMemo {
+                    dir_idx,
+                    entry: if needs_entry {
+                        Self::entry_object(txn, source_loc)
+                    } else {
+                        Value::Null
+                    },
+                    tags: txn.tags.iter().map(ToString::to_string).collect(),
+                    links: txn.links.iter().map(ToString::to_string).collect(),
+                    all_accounts,
+                    description: match &txn.payee {
+                        Some(payee) => format!("{} | {}", payee, txn.narration),
+                        None => txn.narration.to_string(),
+                    },
+                });
+            }
+            let m = memo
+                .as_ref()
+                .expect("memo is populated for this dir_idx immediately above");
+            let entry_val = m.entry.clone();
+            let tags = m.tags.clone();
+            let links = m.links.clone();
+            let all_accounts = &m.all_accounts;
+            let description = m.description.clone();
 
             let year = Value::Integer(i64::from(txn.date.year()));
             let month = Value::Integer(i64::from(txn.date.month()));
@@ -708,10 +768,10 @@ impl Executor<'_> {
             // (issue #1052).
             let weight_val = compute_posting_weight(posting);
 
-            // The running balances come straight from the shared scan
-            // (`needs_balance`/`needs_account_balance` both `true` above), so they
-            // are identical to the old inline accumulators — proven by the
-            // #postings parity test.
+            // The running balances come straight from the shared scan, so when
+            // requested they are identical to the old inline accumulators —
+            // proven by the #postings parity test. When the query reads
+            // neither, the scan skipped them and these stay Null.
             let balance_val = ctx
                 .balance
                 .map_or(Value::Null, |inv| Value::Inventory(Box::new(inv)));
@@ -766,15 +826,27 @@ impl Executor<'_> {
                 balance_val,
                 account_balance_val,
                 // Metadata and collection
-                Value::Metadata(Box::new(Self::augmented_meta(
-                    &posting.meta,
-                    posting_loc.as_ref(),
-                ))),
-                Value::StringSet(all_accounts),
+                if needs_meta {
+                    Value::Metadata(Box::new(Self::augmented_meta(
+                        &posting.meta,
+                        posting_loc.as_ref(),
+                    )))
+                } else {
+                    Value::Null
+                },
+                Value::StringSet(all_accounts.clone()),
                 entry_val,
                 // Hidden metadata columns
-                Self::metadata_to_value(&txn.meta),
-                Self::metadata_to_value(&posting.meta),
+                if needs_meta {
+                    Self::metadata_to_value(&txn.meta)
+                } else {
+                    Value::Null
+                },
+                if needs_meta {
+                    Self::metadata_to_value(&posting.meta)
+                } else {
+                    Value::Null
+                },
             ];
             table.add_row(row);
         }
