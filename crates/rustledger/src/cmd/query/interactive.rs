@@ -47,6 +47,52 @@ fn count_statistics(directives: &[Spanned<Directive>]) -> (usize, usize, usize) 
     (directives.len(), num_transactions, num_postings)
 }
 
+/// Daytech fork: the REPL loop without the terminal.
+///
+/// Reads one query per line from stdin, writes its result, then flushes and
+/// emits a blank line. Callers frame on the trailing `N row(s)` that
+/// `execute_query` already prints. An error goes to stderr and the loop
+/// continues, so one bad query does not kill a pooled worker.
+///
+/// The point is that `directives` stay booked across queries -- the load is
+/// what costs (seconds), the query does not.
+pub(super) fn run_batch(
+    directives: &[Spanned<Directive>],
+    source_map: &SourceMap,
+    display_context: &DisplayContext,
+    account_types: &rustledger_core::AccountTypes,
+    args: &Args,
+) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    // from_args turns the pager ON; that is an interactive-only nicety and it
+    // blocks a piped caller after the first line. The one-shot path in mod.rs
+    // sidesteps it by never reaching the pager branch; we have to say so.
+    let mut settings =
+        ShellSettings::from_args(args, display_context.clone(), account_types.clone());
+    settings.pager = false;
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if matches!(line, ".exit" | ".quit") {
+            break;
+        }
+        let mut stdout = io::stdout();
+        if let Err(e) = execute_query(line, directives, source_map, &settings, &mut stdout) {
+            // No row-count line will follow, so say so on stderr and let the
+            // caller time out and recycle the worker.
+            eprintln!("error: {e:#}");
+        }
+        println!();
+        io::stdout().flush()?;
+    }
+    Ok(())
+}
+
 pub(super) fn run_interactive(
     file: &PathBuf,
     directives: &[Spanned<Directive>],

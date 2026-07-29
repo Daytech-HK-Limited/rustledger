@@ -81,6 +81,18 @@ pub struct Args {
     /// Disable the on-disk parse cache (always re-parse)
     #[arg(long = "no-cache")]
     pub no_cache: bool,
+
+    /// Daytech fork: read queries from stdin, one per line, and flush a result
+    /// after each. No prompt, no readline, no history.
+    ///
+    /// Interactive mode holds the booked ledger between queries, which is
+    /// exactly the daemon a long-lived caller wants -- but it is unusable from
+    /// a pipe. Without a tty rustledger block-buffers, so a reply never
+    /// completes until stdin closes; with a pty you get the prompt, terminal
+    /// echo and ANSI escapes mixed into the output. This mode is the same loop
+    /// with neither problem.
+    #[arg(long = "batch")]
+    pub batch: bool,
 }
 
 /// Output format for query results.
@@ -207,6 +219,14 @@ pub fn run_with_writer<W: io::Write>(args: &Args, out: &mut W) -> Result<()> {
     } else if let Some(ref query_file) = args.query_file {
         fs::read_to_string(query_file)
             .with_context(|| format!("failed to read query file {}", query_file.display()))?
+    } else if args.batch {
+        return interactive::run_batch(
+            &directives,
+            &source_map,
+            &display_context,
+            &ledger.options.to_account_types(),
+            args,
+        );
     } else {
         // Interactive mode
         return interactive::run_interactive(
