@@ -10429,13 +10429,20 @@ fn test_postings_table_column_gate_keeps_metadata_reachable() {
         &directives,
     );
     assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::String("Expenses:Food".to_string()));
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("Expenses:Food".to_string())
+    );
 
     // `entry` is outside wildcard expansion, so it only ever arrives by name —
     // but then it must be real, not gated away.
     let result = execute_query("SELECT entry FROM #postings", &directives);
     assert_eq!(result.rows.len(), 2);
-    assert_ne!(result.rows[0][0], Value::Null, "entry must not be gated out");
+    assert_ne!(
+        result.rows[0][0],
+        Value::Null,
+        "entry must not be gated out"
+    );
 
     // `SELECT *` names no column but expands to every visible one, including
     // gated ones — the wildcard must defeat those gates.
@@ -10457,4 +10464,27 @@ fn test_postings_table_column_gate_keeps_metadata_reachable() {
     // And the case the gate exists for: reading nothing must still count right.
     let result = execute_query("SELECT count(*) FROM #postings", &directives);
     assert_eq!(result.rows[0][0], Value::Integer(2));
+
+    // Every column is gated, not just the expensive four, so every column has
+    // to survive being named on its own. `SELECT *` turns all the gates off, so
+    // it is the reference: selecting one column must give the same value the
+    // wildcard gives for it. A gate wired to the wrong column, or a value
+    // computed under a *different* column's flag, shows up here as a Null
+    // against a populated wildcard cell.
+    let all = execute_query("SELECT * FROM #postings", &directives);
+    for (idx, col) in all.columns.iter().enumerate() {
+        // `SELECT *` does not expand to `entry` or the hidden `_*_meta`
+        // columns, so they have no wildcard cell to compare against; both are
+        // covered by name above.
+        if col.starts_with('_') || col.eq_ignore_ascii_case("entry") {
+            continue;
+        }
+        let one = execute_query(&format!("SELECT {col} FROM #postings"), &directives);
+        for row in 0..all.rows.len() {
+            assert_eq!(
+                one.rows[row][0], all.rows[row][idx],
+                "column `{col}` (row {row}) differs when selected alone -- its gate is wrong"
+            );
+        }
+    }
 }

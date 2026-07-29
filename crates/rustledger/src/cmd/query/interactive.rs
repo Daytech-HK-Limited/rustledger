@@ -1,6 +1,6 @@
 //! Interactive REPL mode for BQL queries.
 
-use super::output::execute_query;
+use super::output::{execute_query, execute_query_with, make_executor};
 use super::{Args, OutputFormat, SYSTEM_TABLES, ShellSettings};
 use anyhow::Result;
 use rustledger_core::{Directive, DisplayContext, Spanned};
@@ -71,6 +71,13 @@ pub(super) fn run_batch(
     let mut settings =
         ShellSettings::from_args(args, display_context.clone(), account_types.clone());
     settings.pager = false;
+
+    // Built once, outside the loop -- see `make_executor`. Rebuilding it per
+    // query re-derives the price database and a filename String per directive,
+    // ~0.25s on a 1.1M-line ledger, on top of whatever the query actually does.
+    // That is the whole point of a batch REPL, so it belongs here.
+    let mut executor = make_executor(directives, source_map, &settings);
+
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -82,7 +89,7 @@ pub(super) fn run_batch(
             break;
         }
         let mut stdout = io::stdout();
-        if let Err(e) = execute_query(line, directives, source_map, &settings, &mut stdout) {
+        if let Err(e) = execute_query_with(line, &mut executor, &settings, &mut stdout) {
             // No row-count line will follow, so say so on stderr and let the
             // caller time out and recycle the worker.
             eprintln!("error: {e:#}");

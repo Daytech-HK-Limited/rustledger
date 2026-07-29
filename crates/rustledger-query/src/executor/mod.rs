@@ -1931,11 +1931,7 @@ impl<'a> Executor<'a> {
     /// `query` is the query being served, used only by `#postings` to decide
     /// whether the expensive `balance` / `account_balance` running-inventory
     /// columns have to be materialized at all.
-    pub(super) fn get_builtin_table(
-        &self,
-        table_name: &str,
-        query: &SelectQuery,
-    ) -> Option<Table> {
+    pub(super) fn get_builtin_table(&self, table_name: &str, query: &SelectQuery) -> Option<Table> {
         // Normalize table name: strip # prefix if present for Python beancount compatibility.
         // Both "#transactions" (rustledger) and "transactions" (beancount) work.
         // Using strip_prefix avoids allocation in the common case.
@@ -2059,7 +2055,10 @@ fn expr_calls_meta_function(expr: &Expr) -> bool {
 /// Return `true` if any part of a `SelectQuery` calls a metadata function.
 /// Same clause coverage as [`query_references_column`].
 pub(super) fn query_calls_meta_function(query: &SelectQuery) -> bool {
-    query.targets.iter().any(|t| expr_calls_meta_function(&t.expr))
+    query
+        .targets
+        .iter()
+        .any(|t| expr_calls_meta_function(&t.expr))
         || query
             .where_clause
             .as_ref()

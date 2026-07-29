@@ -33,13 +33,22 @@ impl SourceFile {
     }
 
     /// Get the line and column (1-based) for a byte offset.
+    ///
+    /// `line_starts` is strictly increasing by construction (0, then every
+    /// index after a `\n`), so this binary-searches. It used to `rposition`,
+    /// i.e. scan the whole vec backwards: O(lines) per call. Every posting row
+    /// that touches `filename`/`lineno`/`location` — or any `META()` call,
+    /// which resolved a location whether or not it needed one — paid that on a
+    /// file with tens of thousands of lines.
     #[must_use]
     pub fn line_col(&self, offset: usize) -> (usize, usize) {
+        // Number of line starts at or before `offset`; minus one is that line's
+        // index. Zero only if `offset` precedes line_starts[0] == 0, which
+        // can't happen for a usize, but saturate rather than wrap.
         let line = self
             .line_starts
-            .iter()
-            .rposition(|&start| start <= offset)
-            .unwrap_or(0);
+            .partition_point(|&start| start <= offset)
+            .saturating_sub(1);
 
         let col = offset - self.line_starts[line];
 

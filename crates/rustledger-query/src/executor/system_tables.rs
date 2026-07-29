@@ -580,6 +580,48 @@ impl Executor<'_> {
             || needs("_posting_meta")
             || query_calls_meta_function(query);
 
+        // The rest of the columns, gated the same way. Gating only the four
+        // above still left ~10 heap allocations per posting for columns nobody
+        // read -- a filename String and a `filename:lineno` format, a Vec<String>
+        // clone each for `accounts` and `other_accounts`, and a String apiece for
+        // `type`, `flag`, `account`, `narration`, `description`. On 90k postings
+        // that was 0.19s for `SELECT count(*) FROM postings`, a query that reads
+        // no column at all, against 0.07s in Python beanquery.
+        //
+        // Each flag is named for the column it guards and is used at exactly one
+        // site below, so the gate cannot drift from the column list the way a
+        // positional mask would.
+        let needs_type = needs("type");
+        let needs_loc = needs("filename") || needs("lineno") || needs("location");
+        let needs_flag = needs("flag");
+        let needs_payee = needs("payee");
+        let needs_narration = needs("narration");
+        let needs_description = needs("description");
+        let needs_tags = needs("tags");
+        let needs_links = needs("links");
+        let needs_posting_flag = needs("posting_flag");
+        let needs_account = needs("account");
+        let needs_other_accounts = needs("other_accounts");
+        let needs_accounts = needs("accounts");
+        // `other_accounts` is derived from the same per-transaction account set.
+        let needs_all_accounts = needs_accounts || needs_other_accounts;
+        let needs_number = needs("number");
+        let needs_currency = needs("currency");
+        let needs_cost = needs("cost_number")
+            || needs("cost_currency")
+            || needs("cost_date")
+            || needs("cost_label");
+        // `balance` forces `position`. The table snapshot of `balance` is
+        // pre-WHERE, so `execute_select_from_table` recomputes it over the
+        // surviving rows -- by reading each row's `position` cell. A query that
+        // names `balance` but not `position` would otherwise get an all-Null
+        // balance. Same trap as `META()` reaching `_posting_meta` without ever
+        // naming it: the consumer is internal, so the gate can't be driven by
+        // the query text alone.
+        let needs_position = needs("position") || needs_balance;
+        let needs_price = needs("price");
+        let needs_weight = needs("weight");
+
         let columns = vec![
             // Entry-level columns
             "type".to_string(),
@@ -672,13 +714,16 @@ impl Executor<'_> {
             let source_loc = self.get_source_location(dir_idx);
 
             if memo.as_ref().is_none_or(|m| m.dir_idx != dir_idx) {
-                let mut all_accounts: Vec<String> = txn
-                    .postings
-                    .iter()
-                    .map(|p| p.account.to_string())
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
+                let mut all_accounts: Vec<String> = if needs_all_accounts {
+                    txn.postings
+                        .iter()
+                        .map(|p| p.account.to_string())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 all_accounts.sort();
                 memo = Some(TxnMemo {
                     dir_idx,
@@ -687,12 +732,24 @@ impl Executor<'_> {
                     } else {
                         Value::Null
                     },
-                    tags: txn.tags.iter().map(ToString::to_string).collect(),
-                    links: txn.links.iter().map(ToString::to_string).collect(),
+                    tags: if needs_tags {
+                        txn.tags.iter().map(ToString::to_string).collect()
+                    } else {
+                        Vec::new()
+                    },
+                    links: if needs_links {
+                        txn.links.iter().map(ToString::to_string).collect()
+                    } else {
+                        Vec::new()
+                    },
                     all_accounts,
-                    description: match &txn.payee {
-                        Some(payee) => format!("{} | {}", payee, txn.narration),
-                        None => txn.narration.to_string(),
+                    description: if needs_description {
+                        match &txn.payee {
+                            Some(payee) => format!("{} | {}", payee, txn.narration),
+                            None => txn.narration.to_string(),
+                        }
+                    } else {
+                        String::new()
                     },
                 });
             }
@@ -710,63 +767,92 @@ impl Executor<'_> {
             let day = Value::Integer(i64::from(txn.date.day()));
 
             // Per-posting source location (the posting's own span), falling back
-            // to the transaction's when the posting has no real span.
-            let posting_loc = self
-                .span_source_location(posting.file_id, posting.span.start)
-                .or_else(|| source_loc.cloned());
+            // to the transaction's when the posting has no real span. Resolving
+            // it formats a fresh filename String; `location` formats a second.
+            //
+            // `needs_meta` also forces it: `augmented_meta` injects the synthetic
+            // `filename`/`lineno` keys into the `meta` column from this location,
+            // so `getitem(meta, 'lineno')` needs it even though the query names
+            // none of the three location columns.
+            let posting_loc = (needs_loc || needs_meta)
+                .then(|| {
+                    self.span_source_location(posting.file_id, posting.span.start)
+                        .or_else(|| source_loc.cloned())
+                })
+                .flatten();
             let loc = posting_loc.as_ref();
-            let (filename, lineno, location) = (
-                Self::source_filename_value(loc),
-                Self::source_lineno_value(loc),
-                Self::source_location_value(loc),
-            );
-
-            let (number, currency) = posting.amount().map_or((Value::Null, Value::Null), |a| {
+            let (filename, lineno, location) = if needs_loc {
                 (
-                    Value::Number(a.number),
-                    Value::String(a.currency.to_string()),
+                    Self::source_filename_value(loc),
+                    Self::source_lineno_value(loc),
+                    Self::source_location_value(loc),
                 )
-            });
+            } else {
+                (Value::Null, Value::Null, Value::Null)
+            };
 
-            let (cost_number, cost_currency, cost_date, cost_label) =
-                if let Some(cost_spec) = &posting.cost {
-                    let units = posting.amount();
-                    if let Some(cost) = units.and_then(|u| cost_spec.resolve(u.number, txn.date)) {
-                        (
-                            Value::Number(cost.number),
-                            Value::String(cost.currency.to_string()),
-                            cost.date.map_or(Value::Null, Value::Date),
-                            cost.label
-                                .as_ref()
-                                .map_or(Value::Null, |l| Value::String(l.clone())),
-                        )
-                    } else {
-                        (Value::Null, Value::Null, Value::Null, Value::Null)
-                    }
+            let (number, currency) = posting
+                .amount()
+                .filter(|_| needs_number || needs_currency)
+                .map_or((Value::Null, Value::Null), |a| {
+                    (
+                        if needs_number {
+                            Value::Number(a.number)
+                        } else {
+                            Value::Null
+                        },
+                        if needs_currency {
+                            Value::String(a.currency.to_string())
+                        } else {
+                            Value::Null
+                        },
+                    )
+                });
+
+            let (cost_number, cost_currency, cost_date, cost_label) = if !needs_cost {
+                (Value::Null, Value::Null, Value::Null, Value::Null)
+            } else if let Some(cost_spec) = &posting.cost {
+                let units = posting.amount();
+                if let Some(cost) = units.and_then(|u| cost_spec.resolve(u.number, txn.date)) {
+                    (
+                        Value::Number(cost.number),
+                        Value::String(cost.currency.to_string()),
+                        cost.date.map_or(Value::Null, Value::Date),
+                        cost.label
+                            .as_ref()
+                            .map_or(Value::Null, |l| Value::String(l.clone())),
+                    )
                 } else {
                     (Value::Null, Value::Null, Value::Null, Value::Null)
-                };
+                }
+            } else {
+                (Value::Null, Value::Null, Value::Null, Value::Null)
+            };
 
-            let position_val = if let Some(units) = posting.amount() {
-                Value::Position(Box::new(Position::from_posting(
+            let position_val = match posting.amount().filter(|_| needs_position) {
+                Some(units) => Value::Position(Box::new(Position::from_posting(
                     units,
                     posting.cost.as_ref(),
                     txn.date,
-                )))
-            } else {
-                Value::Null
+                ))),
+                None => Value::Null,
             };
 
             let price_val = posting
                 .price
                 .as_ref()
+                .filter(|_| needs_price)
                 .and_then(|p| p.amount())
                 .map_or(Value::Null, |a| Value::Amount(a.clone()));
 
             // Weight delegates to `compute_posting_weight` so the `#postings`
             // table and the default-FROM `weight` accessor stay in lockstep
             // (issue #1052).
-            let weight_val = compute_posting_weight(posting);
+            let weight_val = if needs_weight {
+                compute_posting_weight(posting)
+            } else {
+                Value::Null
+            };
 
             // The running balances come straight from the shared scan, so when
             // requested they are identical to the old inline accumulators —
@@ -780,19 +866,28 @@ impl Executor<'_> {
                 .map_or(Value::Null, |inv| Value::Inventory(Box::new(inv)));
 
             // Other accounts: all accounts in the transaction except this posting's.
-            let other_accounts: Vec<String> = all_accounts
-                .iter()
-                .filter(|a| a.as_str() != posting.account.as_ref())
-                .cloned()
-                .collect();
+            let other_accounts: Vec<String> = if needs_other_accounts {
+                all_accounts
+                    .iter()
+                    .filter(|a| a.as_str() != posting.account.as_ref())
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             let posting_flag = posting
                 .flag
+                .filter(|_| needs_posting_flag)
                 .map_or(Value::Null, |f| Value::String(f.to_string()));
 
             let row = vec![
                 // Entry-level
-                Value::String("transaction".to_string()),
+                if needs_type {
+                    Value::String("transaction".to_string())
+                } else {
+                    Value::Null
+                },
                 Value::Integer(dir_idx as i64),
                 Value::Date(txn.date),
                 year,
@@ -802,17 +897,34 @@ impl Executor<'_> {
                 lineno,
                 location,
                 // Transaction-level
-                Value::String(txn.flag.to_string()),
+                if needs_flag {
+                    Value::String(txn.flag.to_string())
+                } else {
+                    Value::Null
+                },
                 txn.payee
                     .as_ref()
+                    .filter(|_| needs_payee)
                     .map_or(Value::Null, |p| Value::String(p.to_string())),
-                Value::String(txn.narration.to_string()),
-                Value::String(description),
+                if needs_narration {
+                    Value::String(txn.narration.to_string())
+                } else {
+                    Value::Null
+                },
+                if needs_description {
+                    Value::String(description)
+                } else {
+                    Value::Null
+                },
                 Value::StringSet(tags),
                 Value::StringSet(links),
                 // Posting-level
                 posting_flag,
-                Value::String(posting.account.to_string()),
+                if needs_account {
+                    Value::String(posting.account.to_string())
+                } else {
+                    Value::Null
+                },
                 Value::StringSet(other_accounts),
                 number,
                 currency,
@@ -834,7 +946,11 @@ impl Executor<'_> {
                 } else {
                     Value::Null
                 },
-                Value::StringSet(all_accounts.clone()),
+                if needs_accounts {
+                    Value::StringSet(all_accounts.clone())
+                } else {
+                    Value::Null
+                },
                 entry_val,
                 // Hidden metadata columns
                 if needs_meta {

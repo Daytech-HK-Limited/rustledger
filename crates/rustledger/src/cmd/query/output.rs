@@ -18,21 +18,51 @@ use std::io::Write;
 /// JOURNAL queries with thousands of lots in the `balance` column (#1086).
 const MAX_COLUMN_WIDTH: usize = u16::MAX as usize;
 
-pub(super) fn execute_query<W: Write>(
+/// Build the executor for a set of directives.
+///
+/// Daytech fork: split out of `execute_query` so a long-lived caller can build
+/// this ONCE and reuse it. `Executor::new_with_sources` is not cheap and none of
+/// what it computes depends on the query:
+///
+/// * the price database — two full passes over every directive, plus
+///   `add_implicit_prices_from_transaction` on every transaction and a final
+///   sort;
+/// * `source_locations` — one heap-allocated filename `String` and one
+///   line/column lookup per directive;
+/// * `account_info` — a pass over every Open/Close.
+///
+/// On a 1.1M-line ledger that is ~0.25s, paid on EVERY query. It was the floor
+/// under every `--batch` timing: a query whose WHERE matched zero rows still
+/// cost 0.26s, against 0.06s for the same query in Python beanquery. Reusing
+/// the executor moves it to session startup, where it is paid once.
+///
+/// Safe to reuse across queries: `execute` takes `&mut self` but the only state
+/// that outlives a call is `regex_cache` (a cache — sharing it means a `~`
+/// pattern compiles its DFA once per session instead of once per query) and
+/// `tables` (CREATE TABLE, which a REPL session is *supposed* to keep). Issue
+/// #958 already made `BALANCES` return a fresh map per call for exactly this
+/// reason.
+pub(super) fn make_executor<'a>(
+    directives: &'a [Spanned<Directive>],
+    source_map: &'a SourceMap,
+    settings: &ShellSettings,
+) -> Executor<'a> {
+    // The source-map-aware constructor, so the `filename`/`lineno` columns
+    // (and `meta`-derived location lookups) resolve to real source positions
+    // instead of NULL.
+    let mut executor = Executor::new_with_sources(directives, source_map);
+    executor.set_account_types(settings.account_types.clone());
+    executor
+}
+
+/// Parse and run one query against an already-built executor, then render it.
+pub(super) fn execute_query_with<W: Write>(
     query_str: &str,
-    directives: &[Spanned<Directive>],
-    source_map: &SourceMap,
+    executor: &mut Executor<'_>,
     settings: &ShellSettings,
     writer: &mut W,
 ) -> Result<()> {
-    // Parse the query
     let query = parse_query(query_str).with_context(|| "failed to parse query")?;
-
-    // Execute. Use the source-map-aware constructor so the `filename`/`lineno`
-    // columns (and `meta`-derived location lookups) resolve to real source
-    // positions instead of NULL.
-    let mut executor = Executor::new_with_sources(directives, source_map);
-    executor.set_account_types(settings.account_types.clone());
     let result = executor
         .execute(&query)
         .with_context(|| "failed to execute query")?;
@@ -47,6 +77,17 @@ pub(super) fn execute_query<W: Write>(
     }
 
     Ok(())
+}
+
+pub(super) fn execute_query<W: Write>(
+    query_str: &str,
+    directives: &[Spanned<Directive>],
+    source_map: &SourceMap,
+    settings: &ShellSettings,
+    writer: &mut W,
+) -> Result<()> {
+    let mut executor = make_executor(directives, source_map, settings);
+    execute_query_with(query_str, &mut executor, settings, writer)
 }
 
 fn write_text<W: Write>(

@@ -107,10 +107,24 @@ impl Executor<'_> {
         // beanquery exposes `filename`/`lineno` as members of a posting's /
         // entry's metadata. Resolve them per scope: posting metadata carries
         // the POSTING's location, entry metadata the enclosing directive's.
-        let posting_loc = self.resolved_source_location(ctx);
-        let entry_loc = ctx
-            .directive_index
-            .and_then(|i| self.get_source_location(i).cloned());
+        //
+        // Only those two keys can ever consult a location — `meta_lookup`
+        // checks the raw map first and `source_location_meta_key` returns None
+        // for everything else — so resolving unconditionally was pure waste on
+        // every other key. Not a cheap waste either: each resolve formats a
+        // fresh filename String and walks the source map. `META('type')` over
+        // 90k postings spent ~0.55s here, against ~0.06s for the same query in
+        // Python beanquery. Gating it is exactly equivalent by construction.
+        let wants_loc = matches!(key.as_str(), "filename" | "lineno");
+        let posting_loc = wants_loc
+            .then(|| self.resolved_source_location(ctx))
+            .flatten();
+        let entry_loc = wants_loc
+            .then(|| {
+                ctx.directive_index
+                    .and_then(|i| self.get_source_location(i).cloned())
+            })
+            .flatten();
 
         let meta_value = match name {
             "META" | "POSTING_META" => Self::meta_lookup(&posting.meta, posting_loc.as_ref(), &key),
