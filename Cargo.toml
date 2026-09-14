@@ -108,7 +108,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_complete_nushell = "4"
 rustyline = { version = "18", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 edit = "0.1"
 shell-words = "1"
 tracing = "0.1"
