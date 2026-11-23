@@ -19,14 +19,7 @@ yanked = "warn"
 # Unmaintained advisories we accept transitively because removing the
 # parent crate isn't actionable today. Re-audit when the upstream crate
 # either resumes maintenance or gets a replacement we can adopt.
-ignore = [
-  # `paste` (proc-macro), pulled in transitively by `ferrolearn-bayes`
-  # via `faer` / `gemm`. Project is unmaintained but the code is stable
-  # and small. No drop-in replacement exists with the same macro
-  # surface. Re-evaluate when faer drops the dep or when a fork
-  # supersedes paste.
-  "RUSTSEC-2024-0436",
-]
+ignore = []
 
 # rand 0.8.x (via cap-rand/wasmtime-wasi) uses thread_rng which is
 
